@@ -1,0 +1,12 @@
+# Build-context hygiene for docker/Dockerfile (context = this module root).
+# Test files aren't compiled by `go build`; main_test.go alone is ~200 KB.
+*_test.go
+
+# Locally built binaries (the image builds its own).
+/comment
+/comment-staging
+
+# VCS / editor noise.
+.git
+.DS_Store
+/docker/.env
