@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/comment-hq/comment-cli/internal/commentbus"
 	"github.com/comment-hq/comment-cli/internal/commentsync"
 )
 
@@ -84,22 +85,39 @@ func runSyncLogin(args []string) error {
 	default:
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		session, err := commentsync.StartDeviceLogin(ctx, commentsync.Options{
-			Home:    *home,
-			Root:    *root,
-			BaseURL: *baseURL,
-		})
-		if err != nil {
-			return err
+		// Sync rides on pairing: if this computer is already paired to the same
+		// origin, provision the read-scoped key over its daemon token — no second
+		// browser approval, because pairing already authorized this machine (the
+		// strictly more powerful agent-install capability). Fall back to the
+		// browser device flow only when unpaired or paired to a different origin.
+		mintedKey, mintErr := syncKeyViaPairing(ctx, *home, *baseURL)
+		if mintErr != nil {
+			// A definitive, actionable pairing state (sync turned off) — surface it
+			// rather than falling through to a browser flow that would mint an
+			// unrelated standalone key.
+			return mintErr
 		}
-		fmt.Fprintf(os.Stderr, "Open this URL to approve local sync:\n%s\n\nCode: %s\n", session.VerificationURI, session.UserCode)
-		key, err = commentsync.PollDeviceLogin(ctx, commentsync.Options{
-			Home:    *home,
-			Root:    *root,
-			BaseURL: *baseURL,
-		}, session)
-		if err != nil {
-			return err
+		if mintedKey != "" {
+			key = mintedKey
+			fmt.Fprintln(os.Stderr, "This computer is already paired — provisioned local sync over the pairing (no browser approval needed).")
+		} else {
+			session, err := commentsync.StartDeviceLogin(ctx, commentsync.Options{
+				Home:    *home,
+				Root:    *root,
+				BaseURL: *baseURL,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Open this URL to approve local sync:\n%s\n\nCode: %s\n", session.VerificationURI, session.UserCode)
+			key, err = commentsync.PollDeviceLogin(ctx, commentsync.Options{
+				Home:    *home,
+				Root:    *root,
+				BaseURL: *baseURL,
+			}, session)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	cfg, err := commentsync.Login(context.Background(), commentsync.Options{
@@ -123,9 +141,55 @@ func runSyncLogin(args []string) error {
 		"scope_label":        cfg.ScopeLabel,
 		"frontmatter_flavor": commentsync.ConfigFrontmatterFlavor(cfg),
 		"links_flavor":       commentsync.ConfigLinksFlavor(cfg),
-		"backgroundSync": cfg.BackgroundSync,
-		"manualOnly":     cfg.ManualOnly,
+		"backgroundSync":     cfg.BackgroundSync,
+		"manualOnly":         cfg.ManualOnly,
 	})
+}
+
+// syncKeyViaPairing mints a read-scoped library-sync key over the daemon pairing
+// token when this computer is already paired to the SAME origin as baseURL, so
+// `comment sync login` needs no second browser approval (pairing already
+// authorized the machine). The caller still runs commentsync.Login with this
+// key, so --root / --frontmatter-flavor / --links-flavor and key validation all
+// apply as usual — only the key's source changes from the browser device flow to
+// the pairing token. Returns ("", false) when unpaired, paired to a different
+// origin. Three outcomes:
+//   - ("<key>", nil): minted over the pairing — use it.
+//   - ("", nil): not applicable (unpaired, different origin, or a transient mint
+//     error) — the caller falls back to the browser device flow.
+//   - ("", err): a definitive, actionable pairing state — sync is turned off for
+//     this computer — so the caller should surface err, NOT mint an unrelated
+//     standalone key via the browser flow.
+func syncKeyViaPairing(ctx context.Context, home, baseURL string) (string, error) {
+	// Resolve the home exactly as commentsync does (--home flag → COMMENT_IO_HOME
+	// → default) so the pairing we read belongs to the SAME home commentsync.Login
+	// will write the key into. Skipping the COMMENT_IO_HOME step would, in a
+	// multi-home setup, read the default home's pairing and could mint a key from
+	// the wrong account into the COMMENT_IO_HOME sync config.
+	if home == "" {
+		home = os.Getenv("COMMENT_IO_HOME")
+	}
+	paths, err := commentbus.ResolvePaths(home)
+	if err != nil {
+		return "", nil
+	}
+	auth, paired, err := commentbus.LoadDaemonAuth(paths)
+	if err != nil || !paired {
+		return "", nil
+	}
+	pairedBase := strings.TrimRight(strings.TrimSpace(auth.BaseURL), "/")
+	targetBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if pairedBase == "" || !strings.EqualFold(pairedBase, targetBase) {
+		return "", nil
+	}
+	key, err := fetchDaemonSyncCredential(ctx, pairedBase, auth.Token)
+	if errors.Is(err, errDaemonSyncCapabilityDisabled) {
+		return "", fmt.Errorf("local sync is turned off for this computer — re-enable it in Settings → Paired computers, then run `comment sync login` again")
+	}
+	if err != nil || strings.TrimSpace(key) == "" {
+		return "", nil
+	}
+	return key, nil
 }
 
 func runSyncOnce(args []string) error {
@@ -163,7 +227,7 @@ func runSyncStatus(args []string) error {
 	}
 	if !status.Configured {
 		fmt.Println("Library sync is not configured.")
-		fmt.Println("Run comment sync login and approve the device in Settings.")
+		fmt.Println("Run comment sync login. If this computer is already paired to the same Comment.io origin, sync is provisioned over that pairing with no second browser approval; otherwise follow the browser approval link it prints.")
 		return nil
 	}
 	fmt.Printf("root: %s\n", status.Root)

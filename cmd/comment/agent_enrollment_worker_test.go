@@ -24,8 +24,9 @@ import (
 // hint -> botletsRegisterInput can be asserted field by field.
 func testEnrollmentBotletsHint() map[string]any {
 	return map[string]any{
-		"runtime":           "claude",
-		"schedule_timezone": "America/New_York",
+		"runtime":              "claude",
+		"schedule_timezone":    "America/New_York",
+		"responds_to_mentions": true,
 		"brain": map[string]any{
 			"workspace_id":     "bw_team",
 			"bot_id":           "bot_xyz",
@@ -553,6 +554,9 @@ func TestAgentEnrollmentWorkerRunsBotletsWiringWhenHintPresent(t *testing.T) {
 	if in.ScheduleTimezone != "America/New_York" {
 		t.Fatalf("mapped schedule timezone = %q, want America/New_York (from the hint)", in.ScheduleTimezone)
 	}
+	if !in.RespondsToMentions {
+		t.Fatalf("mapped responds_to_mentions = %v, want true (from the hint)", in.RespondsToMentions)
+	}
 	if in.BotDisplayName != "Reviewer" {
 		t.Fatalf("mapped display name = %q, want Reviewer", in.BotDisplayName)
 	}
@@ -885,6 +889,75 @@ func TestAgentEnrollmentWorkerVerify5xxAcksRetryableFailure(t *testing.T) {
 	}
 	if body["failure_code"] != "VERIFY_UNAVAILABLE" || body["credential_id"] != testEnrollmentCredID {
 		t.Fatalf("verify-5xx ack = %#v", body)
+	}
+}
+
+// A persistently-failing per-enrollment step (here a 5xx verify) must NOT make
+// the worker re-redeem on every poll — that is the #1321 churn, where each
+// re-redeem makes the server revoke+mint a credential. The stuck enrollment is
+// gated by a per-enrollment exponential backoff, while the LIST poll keeps its
+// base cadence (so a concurrent new/healthy enrollment is never delayed). A
+// success clears the backoff.
+func TestAgentEnrollmentWorkerThrottlesPersistentReRedeem(t *testing.T) {
+	paths := testAgentEnrollmentPaths(t)
+	record := &callRecorder{}
+	stubAgentEnrollmentReload(t, record, nil)
+	verifyFailing := true
+	server := newEnrollmentTestServer(t, record, enrollmentServerConfig{
+		listState: "pending",
+		agentsMe: func(w http.ResponseWriter, _ *http.Request) {
+			if verifyFailing {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"agent_id": "ag_reviewer", "handle": "max.reviewer"})
+		},
+	})
+	writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
+	worker := newAgentEnrollmentWorker(paths)
+	clock := time.Unix(1_700_000_000, 0)
+	worker.nowFn = func() time.Time { return clock }
+
+	// Pass 1: due, redeems + verify(503). The first failure retries at the normal
+	// poll cadence (transient tolerance), so no backoff is armed yet, and the loop
+	// wait stays at the base interval — backing off the whole loop would delay
+	// unrelated new enrollments, so only the stuck item's re-redeem is throttled.
+	if wait := worker.runOnce(context.Background()); wait != agentEnrollmentPollInterval {
+		t.Fatalf("pass 1 wait = %v, want base poll interval", wait)
+	}
+	if n := strings.Count(record.joined(), "redeem"); n != 1 {
+		t.Fatalf("after pass 1, redeem count = %d, want 1", n)
+	}
+
+	// Many more passes WITHOUT advancing the clock: the second failure arms the
+	// per-enrollment backoff, and every subsequent pass then SKIPS the re-redeem.
+	// The loop wait stays fast throughout (concurrent enrollments aren't delayed).
+	// Pre-fix this churned one redeem per poll.
+	for i := 0; i < 7; i++ {
+		if wait := worker.runOnce(context.Background()); wait != agentEnrollmentPollInterval {
+			t.Fatalf("throttled pass wait = %v, want base poll interval", wait)
+		}
+	}
+	if n := strings.Count(record.joined(), "redeem"); n != 2 {
+		t.Fatalf("re-redeem not throttled: redeem count = %d after 8 passes, want 2", n)
+	}
+
+	// Advancing past the backoff window allows exactly one more re-redeem.
+	clock = clock.Add(agentEnrollmentBackoffCap + time.Second)
+	worker.runOnce(context.Background())
+	if n := strings.Count(record.joined(), "redeem"); n != 3 {
+		t.Fatalf("post-backoff redeem count = %d, want 3", n)
+	}
+
+	// Recovery: a successful verify acks installed and clears the backoff state.
+	verifyFailing = false
+	clock = clock.Add(agentEnrollmentBackoffCap + time.Second)
+	if wait := worker.runOnce(context.Background()); wait != agentEnrollmentPollInterval {
+		t.Fatalf("post-recovery wait = %v, want fast poll", wait)
+	}
+	if _, stuck := worker.enrollNextAttempt[testEnrollmentID]; stuck {
+		t.Fatalf("backoff state not cleared after a successful install")
 	}
 }
 

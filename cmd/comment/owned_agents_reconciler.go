@@ -43,10 +43,12 @@ const (
 	// latency lives in the 4s enrollment worker that redeems what this
 	// reconciler enrolls.
 	ownedAgentsReconcileInterval = 60 * time.Second
-	// ownedAgentsReconcileInitialDelay gives the daemon's startup (socket,
-	// profile load, pairing) a moment to settle before the first pass.
-	ownedAgentsReconcileInitialDelay = 10 * time.Second
-	ownedAgentsRequestTimeout        = 30 * time.Second
+	// ownedAgentsReconcileAuthRetryInterval keeps the setup path snappy: the
+	// daemon often starts before pairing finishes, so the initial unpaired no-op
+	// should retry soon enough for account-owned agents such as Guy the Guide to
+	// install right after daemon auth lands.
+	ownedAgentsReconcileAuthRetryInterval = 2 * time.Second
+	ownedAgentsRequestTimeout             = 30 * time.Second
 )
 
 var ownedAgentsHTTPClient = &http.Client{Timeout: ownedAgentsRequestTimeout}
@@ -56,17 +58,28 @@ func startOwnedAgentsReconciler(ctx context.Context, paths commentbus.Paths, bot
 }
 
 func runOwnedAgentsReconciler(ctx context.Context, paths commentbus.Paths, botletsHomeHint string) {
+	runOwnedAgentsReconcilerWithDelays(ctx, paths, botletsHomeHint, ownedAgentsReconcileInterval, ownedAgentsReconcileAuthRetryInterval)
+}
+
+func runOwnedAgentsReconcilerWithDelays(ctx context.Context, paths commentbus.Paths, botletsHomeHint string, steadyDelay time.Duration, authRetryDelay time.Duration) {
 	worker := newOwnedAgentsReconciler(paths)
 	worker.botletsHomeHint = botletsHomeHint
-	timer := time.NewTimer(ownedAgentsReconcileInitialDelay)
+	// The first pass is user-visible during setup: it installs account-owned
+	// agents such as Guy the Guide after pairing. Run it immediately; if pairing
+	// has not landed yet, retry on the short auth cadence before falling back to
+	// the slower convergence interval.
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			worker.runOnce(ctx)
-			timer.Reset(ownedAgentsReconcileInterval)
+			if worker.runOnce(ctx) {
+				timer.Reset(steadyDelay)
+			} else {
+				timer.Reset(authRetryDelay)
+			}
 		}
 	}
 }
@@ -109,6 +122,12 @@ type ownedAgentsManifestAgent struct {
 	// registry's timezone converges (cf carries it as schedule_timezone; null
 	// decodes to ""). Empty for generic agents.
 	ScheduleTimezone string `json:"schedule_timezone"`
+	// RespondsToMentions is the bot's "Responds to @mentions" opt-in (cf carries
+	// it as responds_to_mentions and hashes it into the manifest fingerprint, so
+	// a toggle reaches here as a full manifest). A change must re-enroll so the
+	// local registry's flag converges and the daemon's mention auto-launch gate
+	// sees the new value. Always false for generic agents.
+	RespondsToMentions bool `json:"responds_to_mentions"`
 	// Brain is the desired brain reference for a Botlets bot (null/absent for a
 	// generic agent, and for a server too old to carry it). cf nests
 	// setup_generation under this block (mirroring the redeem hint), and hashes
@@ -148,10 +167,12 @@ type ownedAgentsManifest struct {
 	Agents      []ownedAgentsManifestAgent `json:"agents"`
 }
 
-// runOnce performs one reconcile pass.
-func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
+// runOnce performs one reconcile pass. It returns true after observing paired
+// daemon auth in this pass, so the scheduler can move to the steady cadence
+// without re-reading a pairing file that may have changed after the pass.
+func (w *ownedAgentsReconciler) runOnce(ctx context.Context) bool {
 	if ctx.Err() != nil {
-		return
+		return true
 	}
 	auth, paired, err := commentbus.LoadDaemonAuth(w.paths)
 	if err != nil {
@@ -159,7 +180,7 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 			w.loggedAuthBroken = true
 			w.logWarn("owned_agents.daemon_auth_unreadable", map[string]any{"error": err.Error()})
 		}
-		return
+		return false
 	}
 	if !paired {
 		w.loggedAuthBroken = false
@@ -169,20 +190,20 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 		w.loggedAuthRevoked = false
 		w.lastFingerprint = ""
 		w.lastAgents = nil
-		return
+		return false
 	}
 	if strings.TrimSpace(auth.BaseURL) == "" {
 		if !w.loggedAuthBroken {
 			w.loggedAuthBroken = true
 			w.logWarn("owned_agents.daemon_auth_missing_base_url", map[string]any{"daemon_id": auth.DaemonID})
 		}
-		return
+		return false
 	}
 	w.loggedAuthBroken = false
 	if w.revokedToken != "" && auth.Token == w.revokedToken {
 		// The server told us this exact token is dead. Stop calling with it;
 		// the pairing-file re-read above resumes work after a re-pair.
-		return
+		return true
 	}
 	w.revokedToken = ""
 	w.loggedAuthRevoked = false
@@ -195,7 +216,7 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 			"daemon_id": auth.DaemonID,
 			"error":     fetchErr.Error(),
 		})
-		return
+		return true
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		// Daemon token revoked server-side: log once and park this token.
 		w.revokedToken = auth.Token
@@ -207,20 +228,20 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 				"status":    status,
 			})
 		}
-		return
+		return true
 	case status != http.StatusOK:
 		w.lastFingerprint = ""
 		w.logWarn("owned_agents.reconcile_failed", map[string]any{
 			"daemon_id": auth.DaemonID,
 			"error":     fmt.Sprintf("owned-agents manifest returned status %d", status),
 		})
-		return
+		return true
 	}
 	if !manifest.AutoInstall {
 		// Auto-install is switched off for this daemon: store nothing, do
 		// nothing. The stored fingerprint is left as-is — the server
 		// short-circuits before comparing it anyway.
-		return
+		return true
 	}
 	if manifest.Unchanged {
 		// Fingerprint fast path: nothing changed SERVER-side since the last
@@ -240,9 +261,9 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 				"daemon_id": auth.DaemonID,
 				"handle":    strings.TrimSpace(agent.Handle),
 			})
-			return
+			return true
 		}
-		return
+		return true
 	}
 	enrolled := 0
 	failed := 0
@@ -251,7 +272,7 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 			// Shutdown mid-pass: the pass did not complete, so do not keep a
 			// fingerprint that would skip the unfinished work after a restart.
 			w.lastFingerprint = ""
-			return
+			return true
 		}
 		handle := strings.TrimSpace(agent.Handle)
 		if !commentbus.ProfileRE.MatchString(handle) {
@@ -282,7 +303,7 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 			"daemon_id": auth.DaemonID,
 			"error":     fmt.Sprintf("%d of %d agent enrollment(s) failed", failed, len(manifest.Agents)),
 		})
-		return
+		return true
 	}
 	if enrolled == 0 {
 		// Every manifest agent already has a local profile — the manifest is
@@ -308,6 +329,7 @@ func (w *ownedAgentsReconciler) runOnce(ctx context.Context) {
 		"enrolled":  enrolled,
 		"agents":    len(manifest.Agents),
 	})
+	return true
 }
 
 // agentProfileInstalled reports whether a local agent profile already exists
@@ -397,6 +419,14 @@ func (w *ownedAgentsReconciler) agentLocallyInstalled(agent ownedAgentsManifestA
 	if strings.TrimSpace(entry.Timezone) != strings.TrimSpace(agent.ScheduleTimezone) {
 		return false
 	}
+	// The "Responds to @mentions" opt-in lives on the registry entry, not its
+	// managed-session block; re-install when it drifts from the manifest so the
+	// daemon's mention auto-launch gate reads the desired value. cf always sends
+	// a concrete bool (never null) for a Botlets entry, so a direct compare is
+	// correct (no asymmetric "not asserted" skip like the brain fields below).
+	if entry.RespondsToMentions != agent.RespondsToMentions {
+		return false
+	}
 	// Brain reference: re-install when the server's desired brain projection
 	// differs from the locally recorded one. cf nests these under `brain` and
 	// hashes them into the fingerprint, so a re-provision (setup_generation bump
@@ -444,6 +474,7 @@ func (w *ownedAgentsReconciler) fetchOwnedAgents(ctx context.Context, auth comme
 	}
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("X-Comment-CLI-Version", version)
+	req.Header.Set(runtimeAuthHeaderName, runtimeAuthHeaderValue())
 	resp, err := ownedAgentsHTTPClient.Do(req)
 	if err != nil {
 		return ownedAgentsManifest{}, 0, err

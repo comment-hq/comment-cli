@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1
+#
+# Comment.io AGENT SANDBOX image — the full daemon + Claude Code + Codex running
+# INSIDE the container, so the agent (which executes code, runs tools, edits
+# files) is sandboxed away from the host. Unlike docker/Dockerfile (the
+# distroless SYNC cage), this is a full Debian image with a shell, tmux, Node,
+# and the agent CLIs, with a writable workspace.
+#
+# Build context = the comment-go module root (packages/comment-go), e.g.:
+#   docker build -f docker/Dockerfile.agent -t comment-agent .
+
+# --- build the comment daemon (static, CGO-free) ---
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# version stays "dev" so the in-binary auto-update worker is a no-op; the IMAGE
+# tag carries the version.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+        -o /out/comment ./cmd/comment
+
+# --- runtime: Node base (Claude Code + Codex are Node CLIs) + tmux ---
+FROM node:22-bookworm-slim
+
+# tmux (the only multiplexer — no bmux), git for agent work, ca-certs for TLS,
+# curl/less/ripgrep as common agent tooling.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tmux git ca-certificates curl less ripgrep tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Agent runtimes, pinned-ish via npm. Claude Code provides `claude`; the Codex
+# CLI provides `codex` (its postinstall fetches the right-arch binary).
+RUN npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force
+
+COPY --from=build /out/comment /usr/local/bin/comment
+COPY docker/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
+COPY docker/project-agents.js /usr/local/bin/project-agents.js
+COPY docker/seed-runtime-config.cjs /usr/local/bin/seed-runtime-config.cjs
+RUN chmod +x /usr/local/bin/agent-entrypoint.sh /usr/local/bin/project-agents.js /usr/local/bin/seed-runtime-config.cjs
+
+# Non-root agent user with a writable home (creds + workspace persist via a
+# mounted volume at /home/agent). Pre-create /state + /projected-agents owned by
+# the agent so named volumes mounted there inherit agent ownership (Docker seeds
+# named volumes from the image path's content + ownership).
+#
+# AGENT_UID/AGENT_GID are build args so the container user can MATCH the host
+# user on native Linux, where bind mounts preserve uid/gid (a host-owned
+# $COMMENT_DOCS_DIR / $COMMENT_AGENTS_DIR must be writable by the container user).
+# Build with `--build-arg AGENT_UID=$(id -u) --build-arg AGENT_GID=$(id -g)` (the
+# compose passes HOST_UID/HOST_GID for you). Default 1001 (the node base already
+# uses 1000 for its `node` user; on macOS Docker Desktop bind mounts are uid-mapped
+# so the default just works). --non-unique + getent handle a host uid/gid that
+# collides with the base image's node user/group.
+ARG AGENT_UID=1001
+ARG AGENT_GID=1001
+RUN set -eux; \
+    if ! getent group "${AGENT_GID}" >/dev/null; then groupadd --gid "${AGENT_GID}" agent; fi; \
+    useradd --non-unique --uid "${AGENT_UID}" --gid "${AGENT_GID}" --create-home --shell /bin/bash agent; \
+    mkdir -p /state /state/botlets /projected-agents; \
+    chown -R "${AGENT_UID}:${AGENT_GID}" /state /projected-agents /home/agent
+USER ${AGENT_UID}:${AGENT_GID}
+WORKDIR /home/agent
+
+# COMMENT_IO_HOME (daemon state) is a mount; HOME holds the agent runtimes'
+# creds (~/.claude, ~/.codex) and workspace.
+#
+# BOTLETS_HOME lives UNDER /state (the same volume as the agent profiles in
+# /state/agents) — NOT the default ~/botlets in the home volume. This colocation
+# is a security invariant: the projector excludes Botlets by reading
+# /state/botlets/registry.json, so the registry MUST share the agent profiles'
+# lifecycle. If they were in separate volumes, recreating only the home volume
+# would drop the registry while Botlet credential profiles persisted in /state,
+# and the projector would then leak those secrets as "plain" agents. Both the
+# daemon and the projector resolve BOTLETS_HOME, so they stay in agreement.
+ENV COMMENT_IO_HOME=/state \
+    HOME=/home/agent \
+    BOTLETS_HOME=/state/botlets \
+    COMMENT_IO_AGENT_SANDBOX=1 \
+    COMMENT_IO_ENV=production
+
+# tini as PID 1 so tmux/agent child processes are reaped cleanly. The entrypoint
+# wrapper runs the full daemon (notifications + managed-session launcher) and, when
+# COMMENT_AGENT_PROFILE is set, keeps a headless agent runtime launched for it.
+# Non-`bus run` argv passes straight through to `comment` (so `docker run <img>
+# version`, `bus pair`, etc. still work). Onboarding (pair, agent login) is done
+# via `docker compose exec`; see docker/README.agent.md.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agent-entrypoint.sh"]
+CMD ["bus", "run"]

@@ -23,6 +23,7 @@ var cliHelpOrder = []string{
 	"messages",
 	"activity",
 	"bus",
+	"status",
 	"doctor",
 	"diagnose",
 	"sync",
@@ -82,6 +83,7 @@ var cliHelpTopics = map[string]cliHelpTopic{
 			"`comment run <profile>` uses the runtime saved in `~/.comment-io/agents/<profile>.json`; legacy profiles without a saved runtime default to Claude.",
 			"`comment run` starts Guy, your account guide Botlet; `comment run <bot>` starts another Botlets bot by name.",
 			"For Botlets bots created by `comment botlets setup`, the CLI uses the bot's saved runtime and safety flags.",
+			"When the host CLI was installed by the Docker sandbox flow and no native host daemon is running, `comment run` delegates to the matching `comment-agent-*` container automatically.",
 			"The daemon injects receive nudges into the tmux session; the nudge names a local message id, not a secret or message body.",
 			"`--role main` is the default. Use `--role task` for short-lived helper runtimes.",
 			"`--detach` launches via the daemon but skips the interactive tmux attach. The daemon keeps servicing the detached session, so the agent answers @mentions with no TTY; attach later by re-running the same `comment run`. COMMENT_IO_SKIP_ATTACH=1 does the same for a fixed launch command.",
@@ -196,6 +198,25 @@ var cliHelpTopics = map[string]cliHelpTopic{
 			"comment bus health",
 		},
 		Related: []string{"doctor", "run", "messages", "sync"},
+	},
+	"status": {
+		Name:    "status",
+		Summary: "Show a setup-readiness panel: is this computer paired, and is a coding agent (Claude or Codex) logged in?",
+		Usage: []string{
+			"comment status [--home ~/.comment-io] [--no-color]",
+		},
+		When: []string{
+			"Run this right after install to see what's left before agents can run here.",
+			"The login step glows until you log in to a coding agent — run `claude` (or `claude setup-token`) or `codex login`.",
+		},
+		Notes: []string{
+			"Status is the friendly human view of the same checks `comment doctor` reports as JSON.",
+			"Color/formatting auto-disables when output isn't a terminal or NO_COLOR is set.",
+		},
+		Examples: []string{
+			"comment status",
+		},
+		Related: []string{"doctor", "run", "bus"},
 	},
 	"doctor": {
 		Name:    "doctor",
@@ -397,15 +418,16 @@ var cliHelpTopics = map[string]cliHelpTopic{
 	},
 	"uninstall": {
 		Name:    "uninstall",
-		Summary: "Remove local Comment.io CLI state, plugins, daemon service, and optionally sync projections.",
+		Summary: "Remove local Comment.io CLI state, plugins, daemon service, Docker-mode agent containers, and optionally sync projections.",
 		Usage: []string{
-			"comment uninstall [--home ~/.comment-io] [--botlets-home ~/botlets] [--yes] [--dry-run] [--skip-cli] [--skip-plugins] [--keep-sync-root]",
+			"comment uninstall [--home ~/.comment-io] [--botlets-home ~/botlets] [--yes] [--dry-run] [--skip-cli] [--skip-plugins] [--skip-docker] [--remove-image] [--keep-sync-root]",
 		},
 		When: []string{
 			"Use this when intentionally cleaning this computer's local Comment.io installation.",
 		},
 		Notes: []string{
 			"Prefer `--dry-run` first so you can inspect what will be removed.",
+			"If you installed with the Docker option, this also removes the comment-agent containers and their named volumes (which hold the daemon pairing and agent credentials). Pass `--skip-docker` to leave them, or `--remove-image` to also drop the pulled comment-agent image.",
 		},
 		Related: []string{"doctor", "bus", "sync"},
 	},

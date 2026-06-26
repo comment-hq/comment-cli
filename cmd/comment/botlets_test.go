@@ -429,6 +429,59 @@ func TestWriteBotletsAgentProfileValidatesHandleBeforePathJoin(t *testing.T) {
 	}
 }
 
+// TestBotletsSetupPollResponseCarriesRespondsToMentions pins the interactive
+// `comment botlets setup` contract: the server's approved poll payload includes
+// `responds_to_mentions`, it decodes into botletsSetupPollResponse, and the
+// runBotletsSetup mapping threads it into botletsRegisterInput (and from there
+// into the registry entry's RespondsToMentions). Without this the field
+// defaults to the zero value (false) and a guide that should auto-launch on an
+// @mention never does.
+func TestBotletsSetupPollResponseCarriesRespondsToMentions(t *testing.T) {
+	const pollJSON = `{
+		"status": "approved",
+		"agent_secret": "as_ag_guide_secret",
+		"completion_token": "ct_guide",
+		"owner_agent_id": "ag_owner",
+		"bot_id": "bb_guide",
+		"bot_agent_id": "ag_guide",
+		"bot_slug": "guy",
+		"bot_handle": "max.guy",
+		"bot_name": "Guy the Guide",
+		"setup_generation": 1,
+		"schedule_timezone": "America/New_York",
+		"responds_to_mentions": true,
+		"brain": {"workspaceId": "bw_brain", "containerId": "lc_brain", "rootFolderId": "lf_brain"}
+	}`
+	var poll botletsSetupPollResponse
+	if err := json.Unmarshal([]byte(pollJSON), &poll); err != nil {
+		t.Fatal(err)
+	}
+	if !poll.RespondsToMentions {
+		t.Fatalf("decoded responds_to_mentions = %v, want true", poll.RespondsToMentions)
+	}
+
+	// Mirror the runBotletsSetup mapping into botletsRegisterInput; the flag
+	// must thread through unchanged.
+	in := botletsRegisterInput{
+		ScheduleTimezone:   poll.ScheduleTimezone,
+		RespondsToMentions: poll.RespondsToMentions,
+		Runtime:            "claude",
+	}
+	if !in.RespondsToMentions {
+		t.Fatalf("mapped RespondsToMentions = %v, want true", in.RespondsToMentions)
+	}
+
+	// A payload omitting the field (older server / non-guide bot) decodes to
+	// false — the opt-out default.
+	var off botletsSetupPollResponse
+	if err := json.Unmarshal([]byte(`{"status":"approved","bot_slug":"reviewer"}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	if off.RespondsToMentions {
+		t.Fatalf("absent responds_to_mentions decoded to %v, want false", off.RespondsToMentions)
+	}
+}
+
 func TestPrepareBotletsAgentProfileWithRuntimeWritesRuntime(t *testing.T) {
 	paths, err := commentbus.ResolvePaths(filepath.Join(t.TempDir(), "comment"))
 	if err != nil {

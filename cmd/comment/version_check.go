@@ -186,7 +186,7 @@ func autoUpgradeAndReexec(current string, minimum string) error {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Automatic update failed: %v\n\n", err)
-		fmt.Fprintf(os.Stderr, "Update manually, then re-run your command:\n  npm install -g %s\n", defaultUpgradePackageSpec)
+		fmt.Fprintf(os.Stderr, "Update manually, then re-run your command:\n  npm install -g %s\n", defaultUpgradePackage())
 		return cliExitError{Code: 1}
 	}
 

@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,6 +31,19 @@ func TestMain(m *testing.M) {
 		return commentbus.BmuxInstallResult{Path: "/stub/bmux", AlreadyPresent: true}, nil
 	}
 	busInstallStdinIsInteractive = func() bool { return false }
+	// Default `uninstall`'s Docker discovery to "docker not installed" so the
+	// Docker teardown step never enumerates or removes a developer's REAL
+	// comment-agent-* containers/volumes during `go test` — that lookup hits the
+	// global Docker daemon, not the per-test --home. The Docker uninstall tests
+	// override uninstallLookPath (stubUninstallDocker) and restore it via
+	// t.Cleanup; everything else stays off Docker entirely.
+	realUninstallLookPath := uninstallLookPath
+	uninstallLookPath = func(name string) (string, error) {
+		if name == "docker" {
+			return "", exec.ErrNotFound
+		}
+		return realUninstallLookPath(name)
+	}
 	os.Exit(m.Run())
 }
 

@@ -4,7 +4,45 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// runtimeAuthHeaderName is the daemon poll header that carries which coding
+// runtimes are locally authenticated. The server reads it in requireDaemonAuth
+// and persists it on the paired-daemon record so /setup and `comment status`
+// can show the "log in to a coding agent" readiness step.
+const runtimeAuthHeaderName = "X-Comment-Runtime-Auth"
+
+// reportableRuntimes is the canonical (already-sorted) set of runtimes whose
+// local auth state the daemon reports. Order here defines the header order, so
+// the server's change-detection never churns a write on reordering.
+var reportableRuntimes = []string{"claude", "codex"}
+
+// runtimeAuthHeaderValue returns the comma-separated list of coding runtimes
+// that appear logged in here (e.g. "claude,codex"), or "" when none are. The
+// daemon always sends this header on token-authenticated polls, so the server
+// can tell "nothing logged in yet" (empty value) apart from "daemon too old to
+// report" (header absent).
+//
+// Login state is the ONLY thing checked — deliberately NOT install/PATH. This
+// runs inside the background daemon, whose launchd/systemd PATH does not include
+// user-local install locations (~/.local/bin, Homebrew, nvm — where claude/codex
+// normally live); `comment run` resolves the runtime against the user's
+// interactive PATH on the client instead (see resolveRuntimeCommandPath). So an
+// install/PATH gate here would report "none" for the COMMON case (installed +
+// logged in, just not on the daemon's PATH) and leave /setup stuck after login —
+// a far worse and more common failure than the rare logged-in-but-uninstalled
+// edge. runtimeAuthState reads fixed config paths (~/.claude.json,
+// ~/.codex/auth.json) + env keys, which are reliable in any PATH context.
+func runtimeAuthHeaderValue() string {
+	authed := make([]string, 0, len(reportableRuntimes))
+	for _, runtime := range reportableRuntimes {
+		if ok, _ := runtimeAuthState(runtime); ok {
+			authed = append(authed, runtime)
+		}
+	}
+	return strings.Join(authed, ",")
+}
 
 // runtimeAuthState reports whether the given coding CLI ("claude" or "codex")
 // appears to have valid local auth, plus a one-line "how to log in" hint when it

@@ -95,6 +95,13 @@ type DaemonOptions struct {
 	// Requires TCPListenAddr to be set. Used in containers whose state dir is a
 	// bind mount that can't chmod a socket file (macOS virtiofs).
 	DisableUnixListener bool
+	// MentionAutoStart, when non-nil, launches an already-installed agent's
+	// runtime detached (the same path the web "Start your agent" button uses)
+	// when a doc @mention arrives for a bot whose "Responds to @mentions" flag is
+	// on and nothing is running. nil disables mention auto-launch. It lives in
+	// package main (launchAgentRuntimeDetached), so it is injected here rather
+	// than imported by package commentbus.
+	MentionAutoStart func(ctx context.Context, paths Paths, handle string) error
 }
 
 type NotificationPollerStatus struct {
@@ -174,9 +181,32 @@ type Daemon struct {
 	logger                *structuredLogger
 	socketFileInfo        os.FileInfo
 	pidFileInfo           os.FileInfo
-	shutdownCancel        context.CancelFunc
-	closeOnce             sync.Once
-	closeErr              error
+	// baseCtx is the daemon's long-lived context (the daemonCtx StartDaemon derives
+	// from the caller's ctx). It outlives any per-request/per-ingest context and is
+	// cancelled only when the daemon shuts down (shutdownCancel). Detached work that
+	// must not be torn down with the request that triggered it — notably the
+	// mention-driven auto-launch goroutine — derives from this, NOT from the
+	// short-lived per-ingest context the owner WAIT/REWAKE path cancels the instant
+	// ingest returns. nil for bare &Daemon{} test fixtures; callers fall back to
+	// context.Background() when it's unset.
+	baseCtx        context.Context
+	shutdownCancel context.CancelFunc
+	closeOnce      sync.Once
+	closeErr       error
+	// mentionAutoStart launches an already-installed agent's runtime detached
+	// (the same path the web "Start your agent" button uses) when a doc @mention
+	// arrives for a bot whose "Responds to @mentions" flag is on and nothing is
+	// running. nil disables mention auto-launch entirely (e.g. in unit tests that
+	// never wire it). Injected from cmd/comment because the launch helper lives
+	// in package main; package commentbus cannot import it directly.
+	mentionAutoStart func(ctx context.Context, paths Paths, handle string) error
+	// mentionAutoStartMu guards mentionAutoStartState. Held only for the small
+	// check/update of the per-recipient backoff record — never across the launch.
+	mentionAutoStartMu sync.Mutex
+	// mentionAutoStartState carries per-recipient cooldown + failure backoff +
+	// in-flight tracking, keyed by recipient handle, so a flurry of mentions or a
+	// bot that fails to launch cannot relaunch-loop.
+	mentionAutoStartState map[string]*mentionAutoStartRecord
 }
 
 type SocketResponse struct {
@@ -364,7 +394,10 @@ func StartDaemon(ctx context.Context, options DaemonOptions) (*Daemon, error) {
 		logger:                       logger,
 		socketFileInfo:               socketFileInfo,
 		pidFileInfo:                  pidFileInfo,
+		baseCtx:                      daemonCtx,
 		shutdownCancel:               shutdownCancel,
+		mentionAutoStart:             options.MentionAutoStart,
+		mentionAutoStartState:        map[string]*mentionAutoStartRecord{},
 	}
 	lockOwned = true // daemon.Close() now owns releasing the lock
 	if tcpAddr := options.TCPListenAddr; tcpAddr != "" {
@@ -1723,6 +1756,15 @@ func (d *Daemon) authorize(conn net.Conn, req SocketRequest) *SocketError {
 		if cred.UID != d.expectedUID {
 			return socketError("FORBIDDEN", "local peer uid mismatch", false)
 		}
+		// agents.mint-ephemeral is auth-OPTIONAL on the Unix socket: the
+		// SO_PEERCRED UID gate above is the sole enforcer (a fresh bootstrap
+		// session has no owner capability on disk), and the daemon mints with its
+		// OWN pairing token — granting no authority beyond its existing
+		// agent_enrollment. TCP callers (no peer creds) fall through to the
+		// capability requirement below, so the auth-free path is Unix-only.
+		if req.Op == "agents.mint-ephemeral" && req.Auth == nil {
+			return nil
+		}
 	}
 	if req.Auth == nil {
 		return socketError("UNAUTHORIZED", "missing auth", false)
@@ -2110,6 +2152,16 @@ func (d *Daemon) dispatch(ctx context.Context, req SocketRequest) SocketResponse
 			return SocketResponse{ID: req.ID, OK: false, Error: socketError("FORBIDDEN", "listen.release requires owner auth", false)}
 		}
 		result, err := d.releaseListenHandle(req)
+		if err != nil {
+			return SocketResponse{ID: req.ID, OK: false, Error: err}
+		}
+		return SocketResponse{ID: req.ID, OK: true, Result: result}
+	case "agents.mint-ephemeral":
+		// No owner-auth gate: the socket is already owner-only (0600), the mint
+		// is owner-scoped + server-rate-limited, and this path must work during
+		// a no-credential bootstrap (a fresh session with no ark_ key). The
+		// daemon uses its OWN pairing token to mint; secrets never cross back.
+		result, err := d.mintEphemeralViaPairing(ctx, req)
 		if err != nil {
 			return SocketResponse{ID: req.ID, OK: false, Error: err}
 		}
@@ -6441,6 +6493,33 @@ func (d *Daemon) ingestCloudNotification(ctx context.Context, profile string, bo
 		ingestLocksHeld = false
 		finishLocalStage()
 	}
+	// Auto-start (mention -> launch the recipient bot) MUST run OUTSIDE the ingest
+	// locks (sessionMu/busMu/profileMu). mentionAutoStartTargetIsLive's stale-record
+	// verify-and-forget waits on a transient runtime goroutine (forgetInactiveTransientRuntime
+	// blocks on <-runtime.done); that goroutine can be parked acquiring busMu inside
+	// nudgeTransientReadyQueueHead. Holding busMu here while waiting on it = deadlock,
+	// hanging the whole daemon on a new @mention. So we DON'T call it inline (where it
+	// would run before the deferred unlock). Instead the genuinely-new-message success
+	// path below records the trigger args, and this defer fires the auto-start only
+	// after unlockIngestLocks has released the ingest locks.
+	//
+	// Deferred LIFO ordering is load-bearing: this defer is registered BEFORE
+	// `defer unlockIngestLocks()`, so it runs AFTER the unlock when the function
+	// returns. The in-flight/cooldown reservation (reserveMentionAutoStart, guarded
+	// by the separate mentionAutoStartMu) still serializes concurrent mentions into a
+	// single launch even though the liveness check now runs unlocked.
+	var (
+		autoStartTrigger bool
+		autoStartProfile string
+		autoStartBot     BotRegistryEntry
+		autoStartRawKind string
+	)
+	defer func() {
+		if !autoStartTrigger {
+			return
+		}
+		d.maybeAutoStartRuntimeForMention(ctx, autoStartProfile, autoStartBot, autoStartRawKind)
+	}()
 	defer unlockIngestLocks()
 	releaseDeclined := func(metadataProfile string, messageID string, profileConfig AgentProfile, lease CloudNotificationLease, notificationID string, now time.Time) *SocketError {
 		unlockIngestLocks()
@@ -6731,6 +6810,52 @@ func (d *Daemon) ingestCloudNotification(ctx context.Context, profile string, bo
 		return false, classifyMessageStoreError(err)
 	}
 	_ = WriteMessageSpool(d.paths, inserted)
+	// A genuinely NEW incoming doc notification just landed and is now DURABLY
+	// stored. If the recipient bot opted into "Responds to @mentions" and nothing
+	// is running for it, launch its runtime detached (async; never blocks this
+	// poller). All gates + cooldown/in-flight backoff live in
+	// maybeAutoStartRuntimeForMention. This is the new-message path only — the
+	// existing-message refresh/re-delivery paths above don't auto-launch, so a
+	// re-leased message can't re-trigger a launch.
+	//
+	// Gate on the RAW notification kind (lease.Notification.Type), NOT the stored
+	// message kind: NormalizeNotificationKind collapses mention / reply / comment
+	// / suggestion all into "doc.mention", so the stored kind cannot distinguish a
+	// real @mention from a passive comment/reply/suggestion on a followed doc.
+	// Only a real "mention" or "review_requested" should auto-start the bot
+	// (enforced by mentionAutoStartRawKindEligible inside the deferred fire).
+	//
+	// Arm the trigger HERE — immediately after the durable InsertCloudNotificationMessage
+	// that represents a genuinely-new message of an eligible kind, and BEFORE the
+	// CompleteCloudNotificationWaitOperation completion write below. The completion is a
+	// purely-local lease-bookkeeping write; if it FAILS after the mention is already
+	// durably stored, the path returns an error before reaching this point on a later
+	// poller pass (subsequent passes see an already-stored message, not a new insert,
+	// so they never auto-start). Arming before the completion makes the auto-start
+	// depend only on the mention being durably stored, not on the completion succeeding,
+	// so a completion-write failure can no longer drop the launch.
+	//
+	// This is the ONLY genuinely-new-message success path; every other return above is
+	// a decline/refresh/re-lease/error that must NOT auto-start, and none of them arm
+	// the trigger. The actual fire is deferred: the defer registered above runs AFTER
+	// unlockIngestLocks releases the ingest locks (sessionMu/busMu/profileMu). Invoking
+	// it inline would run it while those locks are still held and can deadlock against a
+	// transient runtime goroutine parked on busMu (see the auto-start defer above). The
+	// final profile/bot/raw-kind values are captured here so the deferred call sees
+	// exactly what this path resolved.
+	//
+	// Arm with currentBot — the post-lease record re-read under profileMu above (the
+	// same value bot was reassigned to). sameCloudNotificationTarget does NOT compare
+	// RespondsToMentions, so a user who toggles the "Responds to @mentions" opt-in
+	// DURING the lease window is reflected only in this refreshed record, not the
+	// pre-lease bot. Capturing currentBot guarantees the deferred auto-start arms on
+	// the latest opt-in (belt-and-suspenders: maybeAutoStartRuntimeForMention also
+	// re-checks RespondsToMentions at fire time). It targets the same handle — only
+	// the freshness of the record differs.
+	autoStartTrigger = true
+	autoStartProfile = profile
+	autoStartBot = currentBot
+	autoStartRawKind = lease.Notification.Type
 	if err := CompleteCloudNotificationWaitOperation(d.paths, op, time.Now().UTC()); err != nil {
 		return false, socketError("UPSTREAM_ERROR", "could not complete notification lease", true)
 	}

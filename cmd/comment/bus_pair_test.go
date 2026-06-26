@@ -111,8 +111,11 @@ func TestBusPairHappyPathWritesDaemonAuth(t *testing.T) {
 	if strings.Contains(output, "ldt_ag_owner_ld_x_test-secret-token") {
 		t.Fatalf("output leaked the daemon token:\n%s", output)
 	}
-	if !strings.Contains(output, server.URL+"/s/welcome") {
-		t.Fatalf("output missing Guy welcome guide link:\n%s", output)
+	if !strings.Contains(output, server.URL+"/welcome") {
+		t.Fatalf("output missing per-user welcome doc link:\n%s", output)
+	}
+	if !strings.Contains(output, "PAIR THIS COMPUTER") || !strings.Contains(output, "ACTION REQUIRED") {
+		t.Fatalf("output missing the emphasized pairing panel:\n%s", output)
 	}
 	if len(*slept) == 0 {
 		t.Fatal("pair never waited between polls")
@@ -141,6 +144,44 @@ func TestBusPairHappyPathWritesDaemonAuth(t *testing.T) {
 	}
 	if len(auth.Capabilities) != 1 || auth.Capabilities[0] != "agent_enrollment:v1" {
 		t.Fatalf("saved capabilities = %#v", auth.Capabilities)
+	}
+}
+
+// COMMENT_IO_PAIR_NO_WELCOME=1 lets a wrapping installer (the docker
+// `--with-cli` flow) own the welcome link as its closing banner instead of
+// having `comment bus pair` print it mid-stream where it gets buried under the
+// host CLI + skill install. The pairing still succeeds; only the welcome line
+// is suppressed.
+func TestBusPairSuppressesWelcomeWhenEnvSet(t *testing.T) {
+	t.Setenv("COMMENT_IO_PAIR_NO_WELCOME", "1")
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 1, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"daemon_token": "ldt_ag_owner_ld_x_test-secret-token",
+			"daemon_id":    "ld_aaaa",
+			"label":        "Test Mac",
+			"capabilities": []string{"agent_enrollment:v1"},
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	if err := busPair(&out, home, "Test Mac", server.URL, false); err != nil {
+		t.Fatalf("busPair err = %v\noutput:\n%s", err, out.String())
+	}
+	output := out.String()
+	if strings.Contains(output, "/welcome") {
+		t.Fatalf("welcome link should be suppressed when COMMENT_IO_PAIR_NO_WELCOME is set:\n%s", output)
+	}
+	// Suppression must not swallow the rest of the success path.
+	if !strings.Contains(output, "Paired this computer") || !strings.Contains(output, "PAIR THIS COMPUTER") {
+		t.Fatalf("output missing pairing panel/success line:\n%s", output)
 	}
 }
 

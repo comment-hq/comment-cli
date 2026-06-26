@@ -49,6 +49,7 @@ type launchAgentConfig struct {
 	BaseURL          string
 	BotletsHome      string
 	BinaryPath       string
+	NpmBinary        string
 	TmuxBinary       string
 	BmuxBinary       string
 	PlistPath        string
@@ -65,6 +66,7 @@ type systemdServiceConfig struct {
 	BaseURL          string
 	BotletsHome      string
 	BinaryPath       string
+	NpmBinary        string
 	TmuxBinary       string
 	BmuxBinary       string
 	UnitPath         string
@@ -97,6 +99,17 @@ func installTmuxBinaryPin() string {
 
 func installBmuxBinaryPin() string {
 	return installBinaryPin(commentbus.ResolveConfiguredBmuxBinary(""), "bmux")
+}
+
+func installNpmBinaryPin() string {
+	if configured := strings.TrimSpace(os.Getenv(autoUpdateNpmBinaryEnv)); configured != "" {
+		return installBinaryPin(configured, "npm")
+	}
+	npm, err := exec.LookPath("npm")
+	if err != nil {
+		return ""
+	}
+	return installBinaryPin(npm, "npm")
 }
 
 func installBinaryPin(pin string, defaultName string) string {
@@ -593,6 +606,7 @@ func newLaunchAgentConfig(home string, botletsHome string, bin string) (commentb
 		BaseURL:          commentbus.StagingServiceBaseURLOverride(),
 		BotletsHome:      resolvedBotletsHome,
 		BinaryPath:       binaryPath,
+		NpmBinary:        installNpmBinaryPin(),
 		TmuxBinary:       installTmuxBinaryPin(),
 		BmuxBinary:       installBmuxBinaryPin(),
 		PlistPath:        filepath.Join(launchAgents, label+".plist"),
@@ -689,6 +703,9 @@ func buildLaunchAgentPlist(cfg launchAgentConfig) string {
 	}
 	if cfg.BaseURL != "" {
 		writePlistStringIndented(&b, "COMMENT_IO_BASE_URL", cfg.BaseURL, 2)
+	}
+	if cfg.NpmBinary != "" {
+		writePlistStringIndented(&b, autoUpdateNpmBinaryEnv, cfg.NpmBinary, 2)
 	}
 	if cfg.TmuxBinary != "" {
 		writePlistStringIndented(&b, "COMMENT_IO_TMUX_BIN", cfg.TmuxBinary, 2)
@@ -1080,6 +1097,7 @@ func newSystemdServiceConfig(home string, botletsHome string, bin string) (comme
 		BaseURL:          commentbus.StagingServiceBaseURLOverride(),
 		BotletsHome:      resolvedBotletsHome,
 		BinaryPath:       binaryPath,
+		NpmBinary:        installNpmBinaryPin(),
 		TmuxBinary:       installTmuxBinaryPin(),
 		BmuxBinary:       installBmuxBinaryPin(),
 		UnitPath:         filepath.Join(unitDir, unitName),
@@ -1143,6 +1161,11 @@ func buildSystemdUnit(cfg systemdServiceConfig) string {
 		b.WriteString(systemdQuoteArg("COMMENT_IO_BASE_URL=" + cfg.BaseURL))
 		b.WriteByte('\n')
 	}
+	if cfg.NpmBinary != "" {
+		b.WriteString("Environment=")
+		b.WriteString(systemdQuoteArg(autoUpdateNpmBinaryEnv + "=" + cfg.NpmBinary))
+		b.WriteByte('\n')
+	}
 	if cfg.TmuxBinary != "" {
 		b.WriteString("Environment=")
 		b.WriteString(systemdQuoteArg("COMMENT_IO_TMUX_BIN=" + cfg.TmuxBinary))
@@ -1169,6 +1192,7 @@ func validateSystemdServiceConfig(cfg systemdServiceConfig) error {
 		"binary path": cfg.BinaryPath,
 		"home":        cfg.Home,
 		"environment": cfg.Environment,
+		"npm binary":  cfg.NpmBinary,
 		"tmux binary": cfg.TmuxBinary,
 		"bmux binary": cfg.BmuxBinary,
 		"stdout path": cfg.StdoutPath,

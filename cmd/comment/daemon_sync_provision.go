@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,6 +15,12 @@ import (
 	"github.com/comment-hq/comment-cli/internal/commentbus"
 	"github.com/comment-hq/comment-cli/internal/commentsync"
 )
+
+// errDaemonSyncCapabilityDisabled is returned when /daemon/sync-credential
+// reports the pairing's sync capability is off (409 CAPABILITY_DISABLED). It is
+// a definitive, actionable state — distinct from a transient mint failure — so
+// callers can surface "re-enable sync" rather than retrying or falling back.
+var errDaemonSyncCapabilityDisabled = errors.New("sync is disabled on this paired computer")
 
 // One-approval trust (Phase 12): a PAIRED daemon self-provisions the
 // read-scoped library-sync credential it needs to project Botlets brains —
@@ -160,6 +167,21 @@ func fetchDaemonSyncCredential(ctx context.Context, base string, token string) (
 		return "", err
 	}
 	defer drainAndClose(resp)
+	if resp.StatusCode == http.StatusConflict {
+		// 409 covers two distinct states: CAPABILITY_DISABLED (sync turned off —
+		// a definitive, actionable state the caller should surface) and
+		// DAEMON_REPLACED (a stale pairing — inapplicable, the caller should fall
+		// back to the browser device flow). Distinguish by the response code so a
+		// replaced pairing isn't misreported as "sync is turned off".
+		var conflict struct {
+			Code string `json:"code"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&conflict)
+		if conflict.Code == "CAPABILITY_DISABLED" {
+			return "", errDaemonSyncCapabilityDisabled
+		}
+		return "", fmt.Errorf("sync credential request returned status 409 (%s)", conflict.Code)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("sync credential request returned status %d", resp.StatusCode)
 	}

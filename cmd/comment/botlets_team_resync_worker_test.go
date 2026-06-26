@@ -773,7 +773,7 @@ func TestResyncBotletsTeamManifestReportsBindingReadyPerAgent(t *testing.T) {
 			_, _ = w.Write([]byte(`{"ok":true,"manifest_generation":3}`))
 		case strings.HasSuffix(r.URL.Path, "/team-manifest"):
 			_, _ = w.Write([]byte(`{"ok":true,"manifest_fingerprint":"btmf_bind","agents":[` +
-				`{"handle":"max.alpha","agent_secret":"as_secret_a","bot_slug":"alpha","bot_agent_id":"ag_alpha","owner_agent_id":"ag_max","bot_id":"bb_alpha","setup_generation":1,"schedule_timezone":"America/Chicago","brain":{"workspaceId":"bw_brain","containerId":"lib_brain","rootFolderId":"fld_brain"}},` +
+				`{"handle":"max.alpha","agent_secret":"as_secret_a","bot_slug":"alpha","bot_agent_id":"ag_alpha","owner_agent_id":"ag_max","bot_id":"bb_alpha","setup_generation":1,"schedule_timezone":"America/Chicago","responds_to_mentions":true,"brain":{"workspaceId":"bw_brain","containerId":"lib_brain","rootFolderId":"fld_brain"}},` +
 				`{"handle":"max.beta","agent_secret":"as_secret_b","bot_slug":"beta","bot_agent_id":"ag_beta","owner_agent_id":"ag_max","bot_id":"bb_beta","setup_generation":1,"brain":{"workspaceId":"bw_brain","containerId":"lib_brain","rootFolderId":"fld_brain"}}]}`))
 		case strings.HasSuffix(r.URL.Path, "/team-manifest/ack"):
 			sawAck = true
@@ -825,6 +825,15 @@ func TestResyncBotletsTeamManifestReportsBindingReadyPerAgent(t *testing.T) {
 	}
 	if captured[1].ScheduleTimezone != "" {
 		t.Fatalf("beta schedule timezone = %q, want empty (manifest omitted it)", captured[1].ScheduleTimezone)
+	}
+	// The manifest's responds_to_mentions opt-in flows into the local
+	// registration so a team bot auto-launches on a @mention; a manifest agent
+	// without it defaults to false (no auto-launch).
+	if !captured[0].RespondsToMentions {
+		t.Fatalf("alpha responds_to_mentions = %v, want true (from the manifest)", captured[0].RespondsToMentions)
+	}
+	if captured[1].RespondsToMentions {
+		t.Fatalf("beta responds_to_mentions = %v, want false (manifest omitted it)", captured[1].RespondsToMentions)
 	}
 	if len(bindings) != 2 {
 		t.Fatalf("binding reports = %d, want 2: %+v", len(bindings), bindings)

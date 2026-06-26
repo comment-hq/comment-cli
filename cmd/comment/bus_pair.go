@@ -121,10 +121,12 @@ func busPair(out io.Writer, home string, label string, baseURL string, force boo
 		return err
 	}
 	expiresIn := time.Duration(start.ExpiresIn) * time.Second
-	fmt.Fprintf(out, "Pairing this computer with %s\n\n", base)
-	fmt.Fprintf(out, "  Open:  %s\n", start.VerificationURIComplete)
-	fmt.Fprintf(out, "  Code:  %s\n\n", start.UserCode)
-	fmt.Fprintf(out, "Approve this computer in your browser. Waiting (the code expires in %s)...\n", expiresIn)
+	renderPairingPrompt(out, base, start)
+	// The wait status streams as plain prose BELOW the closed panel — the panel
+	// is the "what to do" card; this line and the periodic heartbeats from the
+	// poll loop are ongoing status, so they read as a consistent stream instead
+	// of dangling after the box's bottom rule.
+	fmt.Fprintf(out, "Waiting for you to approve it… (the code expires in %s)\n", expiresIn)
 
 	redeemed, err := busPairPollRedeem(ctx, base, start, out)
 	if err != nil {
@@ -187,8 +189,41 @@ func busPair(out io.Writer, home string, label string, baseURL string, force boo
 	}
 	fmt.Fprintf(out, "\nPaired this computer as %q (daemon %s).\n", savedLabel, redeemed.DaemonID)
 	fmt.Fprintln(out, "Manage or revoke paired computers in the web app under Settings -> Paired computers.")
-	fmt.Fprintf(out, "\nNew to Comment.io? Meet Guy, your guide, and see what you can do: %s/s/welcome\n", strings.TrimRight(base, "/"))
+	// The welcome doc is the friendly human next-step. When pairing is driven as
+	// one step of a larger installer (e.g. the docker `--with-cli` flow, which
+	// then prints ~20 more lines of host CLI + skill install), this line would be
+	// buried mid-stream, so the installer sets COMMENT_IO_PAIR_NO_WELCOME=1 and
+	// prints the welcome link itself as the final closing banner. Standalone
+	// `comment bus pair` leaves the env unset and prints it here. Unknown env is
+	// silently ignored by older CLIs, so this stays graceful across version skew.
+	if os.Getenv("COMMENT_IO_PAIR_NO_WELCOME") == "" {
+		fmt.Fprintf(out, "\nNew to Comment.io? Open your welcome doc and meet Guy, your guide: %s/welcome\n", strings.TrimRight(base, "/"))
+	}
 	return nil
+}
+
+// renderPairingPrompt draws the "approve this in your browser" step as a framed
+// action card so it interrupts the install log stream — the structure is what
+// makes the eye stop on the one moment that needs a human. The card holds only
+// the action and the two things to act on (link + code); the wait status streams
+// as plain prose below it (see busPair) so the box closes cleanly on the code.
+// Emphasis is deliberately restrained: bold "ACTION REQUIRED" and a bold code,
+// no glyph markers or reverse-video badges. The only color is the cyan box rule
+// (a border, not text), matching the `comment status` readiness panel. Color
+// auto-disables on non-TTY / NO_COLOR / dumb terminals via colorEnabled, so
+// piped installs and tests get clean plain text.
+func renderPairingPrompt(out io.Writer, base string, start busPairStartResponse) {
+	color := colorEnabled(out)
+	fmt.Fprintln(out)
+	topRule(out, "COMMENT.IO · PAIR THIS COMPUTER", color)
+	fmt.Fprintln(out, bar(color))
+	fmt.Fprintf(out, "%s   %s — approve this computer in your browser\n", bar(color), paint(color, "ACTION REQUIRED", ansiBold))
+	fmt.Fprintf(out, "%s   to link it to %s\n", bar(color), strings.TrimRight(base, "/"))
+	fmt.Fprintln(out, bar(color))
+	fmt.Fprintf(out, "%s   Open:  %s\n", bar(color), start.VerificationURIComplete)
+	fmt.Fprintf(out, "%s   Code:  %s\n", bar(color), paint(color, start.UserCode, ansiBold))
+	bottomRule(out, color)
+	fmt.Fprintln(out)
 }
 
 func sameBusPairBaseURL(a string, b string) bool {

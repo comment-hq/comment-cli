@@ -173,3 +173,133 @@ func TestRuntimeRequestWorkerNoopsWhenUnpaired(t *testing.T) {
 		t.Fatal("launch must not be called while unpaired")
 	}
 }
+
+func envCount(env []string, key string) int {
+	prefix := key + "="
+	n := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// The detached `comment run` must carry the daemon's resolved home (finding 2):
+// a daemon started with `comment bus run --home /custom` has paths.Home=/custom
+// but no COMMENT_IO_HOME in its inherited env, so the launch must pin
+// COMMENT_IO_HOME=/custom or the launched runtime resolves the DEFAULT home and
+// never finds the bot's profile/socket. This guards BOTH callers
+// (mention-auto-launch and the runtime-request worker), which both pass the
+// daemon's Paths through launchAgentRuntimeDetached -> agentRuntimeLaunchEnv.
+func TestAgentRuntimeLaunchEnvPinsDaemonHome(t *testing.T) {
+	t.Setenv("COMMENT_IO_HOME", "/inherited/home")
+	t.Setenv("COMMENT_IO_SKIP_ATTACH", "")
+
+	env := agentRuntimeLaunchEnv(commentbus.Paths{Home: "/custom/home"})
+
+	if got := envValue(env, "COMMENT_IO_HOME"); got != "/custom/home" {
+		t.Fatalf("COMMENT_IO_HOME = %q, want /custom/home (the daemon's resolved home)", got)
+	}
+	if n := envCount(env, "COMMENT_IO_HOME"); n != 1 {
+		t.Fatalf("COMMENT_IO_HOME appears %d times, want exactly 1 (inherited value must be dropped)", n)
+	}
+	if got := envValue(env, "COMMENT_IO_SKIP_ATTACH"); got != "1" {
+		t.Fatalf("COMMENT_IO_SKIP_ATTACH = %q, want 1", got)
+	}
+	if n := envCount(env, "COMMENT_IO_SKIP_ATTACH"); n != 1 {
+		t.Fatalf("COMMENT_IO_SKIP_ATTACH appears %d times, want exactly 1", n)
+	}
+}
+
+// With no home to pin (zero-value Paths, e.g. the runtime-request worker before
+// this change relied on inherited env), the inherited COMMENT_IO_HOME is left
+// untouched so the launched runtime keeps the daemon's default cascade. This
+// proves the change is ADDITIVE and does not regress the runtime-request path.
+func TestAgentRuntimeLaunchEnvPreservesInheritedHomeWhenUnset(t *testing.T) {
+	t.Setenv("COMMENT_IO_HOME", "/inherited/home")
+
+	env := agentRuntimeLaunchEnv(commentbus.Paths{})
+
+	if got := envValue(env, "COMMENT_IO_HOME"); got != "/inherited/home" {
+		t.Fatalf("COMMENT_IO_HOME = %q, want inherited /inherited/home", got)
+	}
+	if n := envCount(env, "COMMENT_IO_HOME"); n != 1 {
+		t.Fatalf("COMMENT_IO_HOME appears %d times, want exactly 1", n)
+	}
+	if got := envValue(env, "COMMENT_IO_SKIP_ATTACH"); got != "1" {
+		t.Fatalf("COMMENT_IO_SKIP_ATTACH = %q, want 1", got)
+	}
+}
+
+// Unix-mode pin (paths.BusTCPAddr empty): the daemon has a Unix socket for the
+// pinned home, so the inherited COMMENT_IO_BUS_TCP_ADDR must be DROPPED. That env
+// var is the only bus dial address resolveCLIPaths keys off the home: it re-applies
+// the dial address whenever the resolved COMMENT_IO_HOME matches the target home.
+// Leaving a parent's address in place would make the child `comment run` resolve
+// the freshly pinned home yet still DIAL the stale TCP address of a DIFFERENT caged
+// daemon. Dropping it lets the child reach the pinned home's Unix socket.
+func TestAgentRuntimeLaunchEnvDropsInheritedBusTCPAddrWhenPinningUnixHome(t *testing.T) {
+	t.Setenv("COMMENT_IO_HOME", "/inherited/home")
+	t.Setenv("COMMENT_IO_BUS_TCP_ADDR", "127.0.0.1:9999")
+
+	// No BusTCPAddr on the resolved Paths == a pure Unix daemon.
+	env := agentRuntimeLaunchEnv(commentbus.Paths{Home: "/custom/home"})
+
+	if got := envValue(env, "COMMENT_IO_HOME"); got != "/custom/home" {
+		t.Fatalf("COMMENT_IO_HOME = %q, want /custom/home", got)
+	}
+	if n := envCount(env, "COMMENT_IO_BUS_TCP_ADDR"); n != 0 {
+		t.Fatalf("COMMENT_IO_BUS_TCP_ADDR appears %d times, want 0 (inherited stale dial address must be dropped for a Unix daemon)", n)
+	}
+	if got := envValue(env, "COMMENT_IO_SKIP_ATTACH"); got != "1" {
+		t.Fatalf("COMMENT_IO_SKIP_ATTACH = %q, want 1", got)
+	}
+}
+
+// TCP-only pin (paths.BusTCPAddr set, e.g. COMMENT_IO_BUS_DISABLE_UNIX=1 — the
+// caged daemon deliberately created NO Unix socket): the TCP dial address is the
+// ONLY way to reach the bus, so the child MUST carry COMMENT_IO_BUS_TCP_ADDR set to
+// the daemon's own resolved address (paths.BusTCPAddr), OVERRIDING any stale
+// inherited value from a different caged daemon. Stripping it (as the Unix case
+// does) would leave the child with no dial address — falling back to a nonexistent
+// Unix socket — and break web "Start your agent" + mention auto-start in TCP-only
+// deployments.
+func TestAgentRuntimeLaunchEnvPinsDaemonBusTCPAddrWhenPinningTCPHome(t *testing.T) {
+	t.Setenv("COMMENT_IO_HOME", "/inherited/home")
+	t.Setenv("COMMENT_IO_BUS_TCP_ADDR", "127.0.0.1:9999") // stale inherited address
+
+	env := agentRuntimeLaunchEnv(commentbus.Paths{Home: "/custom/home", BusTCPAddr: "127.0.0.1:7700"})
+
+	if got := envValue(env, "COMMENT_IO_HOME"); got != "/custom/home" {
+		t.Fatalf("COMMENT_IO_HOME = %q, want /custom/home", got)
+	}
+	if got := envValue(env, "COMMENT_IO_BUS_TCP_ADDR"); got != "127.0.0.1:7700" {
+		t.Fatalf("COMMENT_IO_BUS_TCP_ADDR = %q, want 127.0.0.1:7700 (the daemon's own dial address, overriding the stale inherited 127.0.0.1:9999)", got)
+	}
+	if n := envCount(env, "COMMENT_IO_BUS_TCP_ADDR"); n != 1 {
+		t.Fatalf("COMMENT_IO_BUS_TCP_ADDR appears %d times, want exactly 1 (the stale inherited value must be replaced, not duplicated)", n)
+	}
+	if got := envValue(env, "COMMENT_IO_SKIP_ATTACH"); got != "1" {
+		t.Fatalf("COMMENT_IO_SKIP_ATTACH = %q, want 1", got)
+	}
+}
+
+// With no home to pin (zero-value Paths — the round-6 runtime-request path that
+// relies on the inherited env), the inherited COMMENT_IO_BUS_TCP_ADDR is left
+// untouched: nothing is being re-homed, so the launched runtime keeps the parent's
+// dial address. This proves the bus-address strip is gated on actually pinning a
+// home and stays additive/safe for the bare-Paths case.
+func TestAgentRuntimeLaunchEnvPreservesInheritedBusTCPAddrWhenHomeUnset(t *testing.T) {
+	t.Setenv("COMMENT_IO_HOME", "/inherited/home")
+	t.Setenv("COMMENT_IO_BUS_TCP_ADDR", "127.0.0.1:9999")
+
+	env := agentRuntimeLaunchEnv(commentbus.Paths{})
+
+	if got := envValue(env, "COMMENT_IO_BUS_TCP_ADDR"); got != "127.0.0.1:9999" {
+		t.Fatalf("COMMENT_IO_BUS_TCP_ADDR = %q, want inherited 127.0.0.1:9999 (nothing to re-home)", got)
+	}
+	if n := envCount(env, "COMMENT_IO_BUS_TCP_ADDR"); n != 1 {
+		t.Fatalf("COMMENT_IO_BUS_TCP_ADDR appears %d times, want exactly 1", n)
+	}
+}

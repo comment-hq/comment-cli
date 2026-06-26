@@ -47,6 +47,13 @@ type BotRegistryEntry struct {
 	RegistryRuntime   string                `json:"-"`
 	BrainRef          *BotBrainRef          `json:"brain_ref,omitempty"`
 	ManagedSession    ManagedSessionSetting `json:"managed_session"`
+	// RespondsToMentions mirrors the bot's "Responds to @mentions" opt-in from
+	// the server (the owned-agents manifest / enrollment hint). When true, the
+	// daemon auto-launches the bot's runtime on an incoming doc @mention if no
+	// session is already running — the same launch the web "Start your agent"
+	// button triggers. omitempty so existing registry files stay byte-stable
+	// until the flag is set.
+	RespondsToMentions bool `json:"responds_to_mentions,omitempty"`
 }
 
 type BotBrainRef struct {

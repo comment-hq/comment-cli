@@ -1,0 +1,89 @@
+# Comment.io AGENT SANDBOX — the full daemon + Claude Code + Codex running inside
+# the container, sandboxed from the host. See docker/README.agent.md.
+#
+# Required host env (or an .env beside this file):
+#   COMMENT_DOCS_DIR   absolute host path for the synced docs (projected to host)
+# Optional:
+#   COMMENT_AGENTS_DIR absolute host path that the container projects PLAIN (non-
+#                      Botlet) agent profiles into, so a host-native coding agent
+#                      can grab + use those handles. Botlet creds stay container-
+#                      only. Point a host coding agent at it with
+#                      COMMENT_IO_HOME=<parent> (the dir is the agents/ folder), or
+#                      symlink it into ~/.comment-io[-staging]/agents. SECURITY:
+#                      this writes plain-agent agent_secret files to the host — the
+#                      deliberate, scoped relaxation the host/docker split asks for.
+#   COMMENT_IO_ENV     "production" (default) or "staging" (comt.dev)
+#   COMMENT_IO_BASE_URL          point the daemon at a custom Comment.io host
+#   COMMENT_IO_STAGING_BASE_URL  same, but staging-only (e.g. a personal staging
+#                                like https://you.comt.dev) — with COMMENT_IO_ENV=staging.
+#                                MUST match the host where your account/agents live,
+#                                or pairing/enrollment land on the wrong backend.
+#   COMMENT_AGENT_PROFILE  agent handle to auto-launch headless once paired+logged
+#                          in (e.g. "you.default"); unset = daemon only. The
+#                          runtime (claude/codex) follows the profile's saved
+#                          `runtime` field.
+
+services:
+  comment-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+      args:
+        # On native Linux, set HOST_UID/HOST_GID so the container user matches the
+        # owner of the bind-mounted host dirs (bind mounts preserve uid/gid there):
+        #   export HOST_UID=$(id -u) HOST_GID=$(id -g)   # then `compose up --build`
+        # On macOS Docker Desktop bind mounts are uid-mapped, so the default works.
+        AGENT_UID: "${HOST_UID:-1001}"
+        AGENT_GID: "${HOST_GID:-1001}"
+    image: comment-agent:local
+    environment:
+      COMMENT_IO_ENV: "${COMMENT_IO_ENV:-production}"
+      COMMENT_IO_HOME: /state
+      # Optional custom-host overrides. Must match the host your account/agents
+      # live on (e.g. a personal staging you.comt.dev) — otherwise pairing and
+      # agent enrollment land on the wrong backend.
+      COMMENT_IO_BASE_URL: "${COMMENT_IO_BASE_URL:-}"
+      COMMENT_IO_STAGING_BASE_URL: "${COMMENT_IO_STAGING_BASE_URL:-}"
+      # OPTIONAL: keep one handle's runtime launched headless IN the container
+      # (detached; the daemon services it). Off by default — in the clean split,
+      # plain agents run on the HOST and Botlets auto-run via the daemon.
+      COMMENT_AGENT_PROFILE: "${COMMENT_AGENT_PROFILE:-}"
+      # Where the entrypoint projects plain-agent profiles inside the container
+      # (bind-mounted to COMMENT_AGENTS_DIR on the host). The projector self-
+      # disables if this dir isn't mounted.
+      COMMENT_AGENTS_PROJECTION_DIR: /projected-agents
+    volumes:
+      # Daemon state (creds, pairing, sqlite, Unix socket). A NAMED VOLUME, not a
+      # host bind: it lives on the VM's ext4 so the daemon can chmod its socket
+      # (a host virtiofs bind mount fails that on macOS), and creds persist across
+      # restarts. Not projected to the host (the host doesn't need it).
+      - comment-agent-state:/state
+      # Agent home: ~/.claude + ~/.codex creds and the agent's workspace. Named
+      # volume so logins + work persist and stay isolated from the host's own
+      # ~/.claude/~/.codex.
+      - comment-agent-home:/home/agent
+      # Host bind: synced docs, projected to the host. Configure the library sync
+      # root to /docs at login: `comment sync login --root /docs`.
+      - "${COMMENT_DOCS_DIR:?set COMMENT_DOCS_DIR to an absolute host path}:/docs"
+      # PLAIN (non-Botlet) agent profiles projected for host coding agents to grab
+      # + use. Set COMMENT_AGENTS_DIR to an absolute host path to project to the
+      # host; leave it unset and projection goes to an internal named volume
+      # (host-invisible — effectively keeps ALL creds container-only). Botlet creds
+      # are NEVER projected here regardless.
+      - "${COMMENT_AGENTS_DIR:-comment-agent-projected}:/projected-agents"
+    # Egress open (default bridge — agents need the Claude/OpenAI APIs, npm,
+    # github, …). Deliberately absent: no docker.sock, no network_mode:host, no
+    # host filesystem beyond /docs + the optional plain-agent projection. The
+    # agent is powerful INSIDE the box; the host is protected by having no other
+    # mounts and no socket. Botlet credentials never leave the container.
+    restart: unless-stopped
+    # Host CLI is OPTIONAL: the daemon talks to its in-container runtimes over the
+    # Unix socket, so no published port is needed. To use a host-native `comment`
+    # against this sandbox, add the TCP transport (COMMENT_IO_BUS_TCP_LISTEN +
+    # a 127.0.0.1 published port) — see README.agent.md.
+
+volumes:
+  comment-agent-state:
+  comment-agent-home:
+  # Fallback projection target when COMMENT_AGENTS_DIR is unset (host-invisible).
+  comment-agent-projected:

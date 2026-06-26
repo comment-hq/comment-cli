@@ -305,14 +305,15 @@ func botletsRegistryHandles(botletsHome string) (map[string]bool, bool) {
 // re-enroll when a bot's runtime, schedule timezone, or brain setup generation
 // changes server-side while its handle stays the same.
 type botletsRegistryInstalledState struct {
-	Runtime         string
-	Timezone        string
-	WorkspaceID     string
-	OwnerAgentID    string
-	BotAgentID      string
-	ContainerID     string
-	RootFolderID    string
-	SetupGeneration int
+	Runtime            string
+	Timezone           string
+	RespondsToMentions bool
+	WorkspaceID        string
+	OwnerAgentID       string
+	BotAgentID         string
+	ContainerID        string
+	RootFolderID       string
+	SetupGeneration    int
 }
 
 // botletsRegistryEntries reads <botletsHome>/registry.json raw (no profile
@@ -332,7 +333,8 @@ func botletsRegistryEntries(botletsHome string) (map[string]botletsRegistryInsta
 				Runtime  string `json:"runtime"`
 				Timezone string `json:"timezone"`
 			} `json:"managed_session"`
-			BrainRef *struct {
+			RespondsToMentions bool `json:"responds_to_mentions"`
+			BrainRef           *struct {
 				WorkspaceID     string `json:"workspace_id"`
 				OwnerAgentID    string `json:"owner_agent_id"`
 				BotAgentID      string `json:"bot_agent_id"`
@@ -348,8 +350,9 @@ func botletsRegistryEntries(botletsHome string) (map[string]botletsRegistryInsta
 	entries := make(map[string]botletsRegistryInstalledState, len(registry.Bots))
 	for _, bot := range registry.Bots {
 		state := botletsRegistryInstalledState{
-			Runtime:  bot.ManagedSession.Runtime,
-			Timezone: bot.ManagedSession.Timezone,
+			Runtime:            bot.ManagedSession.Runtime,
+			Timezone:           bot.ManagedSession.Timezone,
+			RespondsToMentions: bot.RespondsToMentions,
 		}
 		if bot.BrainRef != nil {
 			state.WorkspaceID = bot.BrainRef.WorkspaceID

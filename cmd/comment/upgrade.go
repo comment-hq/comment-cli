@@ -14,9 +14,12 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/comment-hq/comment-cli/internal/commentbus"
 )
 
 const defaultUpgradePackageSpec = "@comment-io/cli@latest"
+const stagingUpgradePackageSpec = "@comment-io/cli@staging"
 
 var upgradeCombinedOutput = func(ctx context.Context, env []string, command string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
@@ -41,12 +44,12 @@ var upgradeLookPath = exec.LookPath
 var upgradeDaemonHealthRetryDelay = 500 * time.Millisecond
 
 type upgradeOptions struct {
-	Home          string
+	Home        string
 	BotletsHome string
-	PackageSpec   string
-	NPM           string
-	SkipDaemon    bool
-	DryRun        bool
+	PackageSpec string
+	NPM         string
+	SkipDaemon  bool
+	DryRun      bool
 }
 
 type upgradeInstalledPaths struct {
@@ -100,6 +103,9 @@ func runUpgrade(args []string) error {
 func defaultUpgradePackage() string {
 	if value := strings.TrimSpace(os.Getenv("COMMENT_IO_CLI_PACKAGE")); value != "" {
 		return value
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(commentbus.EnvVar)), commentbus.EnvStaging) {
+		return stagingUpgradePackageSpec
 	}
 	return defaultUpgradePackageSpec
 }
@@ -215,7 +221,7 @@ func performUpgrade(ctx context.Context, options upgradeOptions) (map[string]any
 	daemonArgs = appendOptionalFlag(daemonArgs, "--home", options.Home)
 	daemonArgs = appendOptionalFlag(daemonArgs, "--botlets-home", options.BotletsHome)
 	daemonArgs = append(daemonArgs, "--bin", paths.ServiceBin)
-	daemonResult, err := runUpgradeJSONCommandWithEnv(ctx, 2*time.Minute, upgradeDaemonInstallEnv(options), paths.ServiceBin, daemonArgs...)
+	daemonResult, err := runUpgradeJSONCommandWithEnv(ctx, 2*time.Minute, upgradeDaemonInstallEnv(options, npmBin), paths.ServiceBin, daemonArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("daemon reinstall failed: %w", err)
 	}
@@ -294,11 +300,15 @@ func validateUpgradeCLIHealth(health map[string]any, expectedVersion string) err
 	return nil
 }
 
-func upgradeDaemonInstallEnv(options upgradeOptions) []string {
-	if options.BotletsHome != "" {
-		return nil
+func upgradeDaemonInstallEnv(options upgradeOptions, npmBin string) []string {
+	env := os.Environ()
+	if strings.TrimSpace(npmBin) != "" {
+		env = envWithValue(env, autoUpdateNpmBinaryEnv, filepath.Clean(npmBin))
 	}
-	return envWithValue(os.Environ(), "BOTLETS_HOME", "")
+	if options.BotletsHome == "" {
+		env = envWithValue(env, "BOTLETS_HOME", "")
+	}
+	return env
 }
 
 func envWithValue(env []string, key string, value string) []string {

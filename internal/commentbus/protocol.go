@@ -47,6 +47,7 @@ var socketOperations = map[string]struct{}{
 	"listen.handles":          {},
 	"listen.claim":            {},
 	"listen.release":          {},
+	"agents.mint-ephemeral":   {},
 }
 
 func sessionAuthAllowedForOperation(op string) bool {
@@ -205,6 +206,16 @@ func validateSocketEnvelopeForAuth(req SocketRequest) error {
 		}
 		return nil
 	}
+	// agents.mint-ephemeral runs during a no-credential bootstrap (a fresh
+	// session with no ark_ key and no owner capability), so auth is OPTIONAL:
+	// the socket is already UID-gated to the owner and the daemon mints with its
+	// OWN pairing token. If auth IS supplied it must still be well-formed.
+	if req.Op == "agents.mint-ephemeral" {
+		if req.Auth == nil {
+			return nil
+		}
+		return validateSocketAuth(*req.Auth)
+	}
 	if req.Auth == nil {
 		return errors.New("missing auth")
 	}
@@ -316,9 +327,29 @@ func validateSocketParams(op string, params map[string]any) error {
 		return validateListenClaimParams(params)
 	case "listen.release":
 		return validateListenClaimParams(params)
+	case "agents.mint-ephemeral":
+		return validateMintEphemeralParams(params)
 	default:
 		return errors.New("invalid operation")
 	}
+}
+
+// validateMintEphemeralParams accepts a required, safe `session` token (the
+// stable per-session id the cred is keyed to) and an optional `display_name`.
+func validateMintEphemeralParams(params map[string]any) error {
+	if err := exactParams(params, "session", "display_name"); err != nil {
+		return err
+	}
+	if !isListenSessionToken(params["session"]) {
+		return errors.New("invalid session")
+	}
+	if value, ok := params["display_name"]; ok {
+		name, isStr := value.(string)
+		if !isStr || len(name) > 200 || strings.ContainsRune(name, '\x00') || containsSecretValue(name) {
+			return errors.New("invalid display_name")
+		}
+	}
+	return nil
 }
 
 func validateListenClaimParams(params map[string]any) error {

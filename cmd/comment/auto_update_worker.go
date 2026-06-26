@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,6 +58,7 @@ const (
 	// does not wait for this cap.
 	autoUpdateMaxAttempts    = 3
 	autoUpdateRequestTimeout = 30 * time.Second
+	autoUpdateNpmBinaryEnv   = "COMMENT_IO_NPM_BIN"
 )
 
 // Seams for tests. Production wiring lives in the defaults below.
@@ -67,11 +70,11 @@ var (
 	// (`npm install -g <pkg>@<version>`). Stubbed in tests so they never shell
 	// out.
 	autoUpdateRunNpmInstall = func(ctx context.Context, spec string) error {
-		npm, err := upgradeLookPath("npm")
-		if err != nil || strings.TrimSpace(npm) == "" {
-			npm = "npm"
+		npm, err := resolveAutoUpdateNpmBinary()
+		if err != nil {
+			return err
 		}
-		_, runErr := upgradeCombinedOutput(ctx, nil, npm, "install", "-g", spec)
+		_, runErr := upgradeCombinedOutput(ctx, autoUpdateNpmCommandEnv(npm), npm, "install", "-g", spec)
 		return runErr
 	}
 
@@ -100,7 +103,101 @@ var (
 	// and that the agent profiles load — i.e. the daemon can actually function on
 	// the new binary. Stubbed in tests to force healthy/unhealthy outcomes.
 	autoUpdateHealthCheck = defaultAutoUpdateHealthCheck
+
+	autoUpdateNpmFallbackPaths = defaultAutoUpdateNpmFallbackPaths
 )
+
+func resolveAutoUpdateNpmBinary() (string, error) {
+	if pinned := strings.TrimSpace(os.Getenv(autoUpdateNpmBinaryEnv)); pinned != "" {
+		if filepath.IsAbs(pinned) || strings.Contains(pinned, string(os.PathSeparator)) {
+			clean := pinned
+			if !filepath.IsAbs(clean) {
+				abs, err := filepath.Abs(clean)
+				if err != nil {
+					return "", err
+				}
+				clean = abs
+			}
+			clean = filepath.Clean(clean)
+			if err := validateUpgradeExecutable(clean, "npm binary"); err != nil {
+				return "", err
+			}
+			return clean, nil
+		}
+		resolved, err := upgradeLookPath(pinned)
+		if err != nil {
+			return "", fmt.Errorf("%s=%q not found on PATH: %w", autoUpdateNpmBinaryEnv, pinned, err)
+		}
+		return resolved, nil
+	}
+	resolved, err := upgradeLookPath("npm")
+	if err != nil || strings.TrimSpace(resolved) == "" {
+		for _, candidate := range autoUpdateNpmFallbackPaths() {
+			clean := filepath.Clean(strings.TrimSpace(candidate))
+			if clean == "." || !filepath.IsAbs(clean) {
+				continue
+			}
+			if validateUpgradeExecutable(clean, "npm binary") == nil {
+				return clean, nil
+			}
+		}
+		return "", fmt.Errorf("npm not found on PATH; reinstall the daemon from an interactive shell with npm available, or set %s to an absolute npm path", autoUpdateNpmBinaryEnv)
+	}
+	return resolved, nil
+}
+
+func defaultAutoUpdateNpmFallbackPaths() []string {
+	paths := []string{
+		"/opt/homebrew/bin/npm",
+		"/usr/local/bin/npm",
+		"/usr/bin/npm",
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		paths = append(paths,
+			filepath.Join(home, ".local", "bin", "npm"),
+			filepath.Join(home, ".npm-global", "bin", "npm"),
+		)
+	}
+	return paths
+}
+
+func autoUpdateNpmCommandEnv(npm string) []string {
+	dir := filepath.Dir(strings.TrimSpace(npm))
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return envWithPrependedPath(os.Environ(), filepath.Clean(dir))
+}
+
+func envWithPrependedPath(env []string, dir string) []string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" || dir == "." {
+		return env
+	}
+	prefix := "PATH="
+	sep := string(os.PathListSeparator)
+	next := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			if !replaced {
+				old := strings.TrimPrefix(entry, prefix)
+				if old != "" {
+					next = append(next, prefix+dir+sep+old)
+				} else {
+					next = append(next, prefix+dir)
+				}
+				replaced = true
+			}
+			continue
+		}
+		next = append(next, entry)
+	}
+	if !replaced {
+		next = append(next, prefix+dir)
+	}
+	return next
+}
 
 func startAutoUpdateWorker(ctx context.Context, paths commentbus.Paths, botletsHome string) {
 	go runAutoUpdateWorker(ctx, paths, botletsHome, autoUpdateInterval)

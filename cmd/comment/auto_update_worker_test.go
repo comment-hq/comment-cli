@@ -29,6 +29,7 @@ func withAutoUpdateSeams(t *testing.T, ver string,
 	origNpm := autoUpdateRunNpmInstall
 	origBus := autoUpdateRunBusInstall
 	origHealth := autoUpdateHealthCheck
+	origFallbackPaths := autoUpdateNpmFallbackPaths
 	origNow := autoUpdateNow
 	version = ver
 	autoUpdateFetch = fetch
@@ -41,6 +42,7 @@ func withAutoUpdateSeams(t *testing.T, ver string,
 	// 2-arg stub (TestAutoUpdateHealthCheckCarriesBotletsHome assigns the seam
 	// directly to assert the threading).
 	autoUpdateHealthCheck = func(ctx context.Context, paths commentbus.Paths, _ string) error { return health(ctx, paths) }
+	autoUpdateNpmFallbackPaths = origFallbackPaths
 	autoUpdateNow = func() time.Time { return time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC) }
 	t.Cleanup(func() {
 		version = origVersion
@@ -48,6 +50,7 @@ func withAutoUpdateSeams(t *testing.T, ver string,
 		autoUpdateRunNpmInstall = origNpm
 		autoUpdateRunBusInstall = origBus
 		autoUpdateHealthCheck = origHealth
+		autoUpdateNpmFallbackPaths = origFallbackPaths
 		autoUpdateNow = origNow
 	})
 	t.Setenv("COMMENT_IO_HOME", t.TempDir())
@@ -68,6 +71,114 @@ func testAutoUpdatePaths(t *testing.T) commentbus.Paths {
 func okFetch(latest string, minimum string) func(context.Context, string, string, string, string) (versionCheckResponse, error) {
 	return func(context.Context, string, string, string, string) (versionCheckResponse, error) {
 		return versionCheckResponse{Latest: latest, Minimum: minimum}, nil
+	}
+}
+
+func TestResolveAutoUpdateNpmBinaryUsesPinnedServicePath(t *testing.T) {
+	npm := filepath.Join(t.TempDir(), "npm")
+	if err := os.WriteFile(npm, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(autoUpdateNpmBinaryEnv, npm)
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
+
+	got, err := resolveAutoUpdateNpmBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != npm {
+		t.Fatalf("resolved npm = %q, want pinned %q", got, npm)
+	}
+}
+
+func TestResolveAutoUpdateNpmBinaryFailsClearlyWhenLaunchdPathCannotFindNpm(t *testing.T) {
+	origLookPath := upgradeLookPath
+	upgradeLookPath = func(string) (string, error) {
+		return "", os.ErrNotExist
+	}
+	origFallbackPaths := autoUpdateNpmFallbackPaths
+	autoUpdateNpmFallbackPaths = func() []string { return nil }
+	t.Cleanup(func() {
+		upgradeLookPath = origLookPath
+		autoUpdateNpmFallbackPaths = origFallbackPaths
+	})
+	t.Setenv(autoUpdateNpmBinaryEnv, "")
+
+	_, err := resolveAutoUpdateNpmBinary()
+	if err == nil {
+		t.Fatal("expected missing npm to return an error")
+	}
+	if !strings.Contains(err.Error(), autoUpdateNpmBinaryEnv) || !strings.Contains(err.Error(), "npm not found on PATH") {
+		t.Fatalf("missing-npm error = %v, want actionable daemon reinstall guidance", err)
+	}
+}
+
+func TestResolveAutoUpdateNpmBinaryFallsBackToCommonInstallPath(t *testing.T) {
+	npm := filepath.Join(t.TempDir(), "npm")
+	if err := os.WriteFile(npm, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origLookPath := upgradeLookPath
+	upgradeLookPath = func(string) (string, error) {
+		return "", os.ErrNotExist
+	}
+	origFallbackPaths := autoUpdateNpmFallbackPaths
+	autoUpdateNpmFallbackPaths = func() []string { return []string{filepath.Join(t.TempDir(), "missing-npm"), npm} }
+	t.Cleanup(func() {
+		upgradeLookPath = origLookPath
+		autoUpdateNpmFallbackPaths = origFallbackPaths
+	})
+	t.Setenv(autoUpdateNpmBinaryEnv, "")
+
+	got, err := resolveAutoUpdateNpmBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != npm {
+		t.Fatalf("resolved npm = %q, want fallback %q", got, npm)
+	}
+}
+
+func TestAutoUpdateRunNpmInstallPrependsPinnedNpmDirToPath(t *testing.T) {
+	dir := t.TempDir()
+	npm := filepath.Join(dir, "npm")
+	if err := os.WriteFile(npm, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(autoUpdateNpmBinaryEnv, npm)
+	t.Setenv("PATH", "/usr/bin")
+
+	origCombined := upgradeCombinedOutput
+	var capturedEnv []string
+	var capturedCommand string
+	var capturedArgs []string
+	upgradeCombinedOutput = func(_ context.Context, env []string, command string, args ...string) ([]byte, error) {
+		capturedEnv = append([]string(nil), env...)
+		capturedCommand = command
+		capturedArgs = append([]string(nil), args...)
+		return nil, nil
+	}
+	t.Cleanup(func() { upgradeCombinedOutput = origCombined })
+
+	if err := autoUpdateRunNpmInstall(context.Background(), "@comment-io/cli@1.2.3"); err != nil {
+		t.Fatal(err)
+	}
+	if capturedCommand != npm {
+		t.Fatalf("npm command = %q, want %q", capturedCommand, npm)
+	}
+	if strings.Join(capturedArgs, " ") != "install -g @comment-io/cli@1.2.3" {
+		t.Fatalf("npm args = %v", capturedArgs)
+	}
+	pathValue := ""
+	for _, entry := range capturedEnv {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathValue = strings.TrimPrefix(entry, "PATH=")
+			break
+		}
+	}
+	wantPrefix := dir + string(os.PathListSeparator)
+	if !strings.HasPrefix(pathValue, wantPrefix) {
+		t.Fatalf("PATH = %q, want npm dir prefix %q", pathValue, wantPrefix)
 	}
 }
 

@@ -403,6 +403,9 @@ func defaultRunRuntimeCommand(options runtimeRunOptions) (err error) {
 			emitBotletsLocalRuntimeFailed(paths, options, err)
 		}
 	}()
+	if handled, dockerErr := maybeDelegateRuntimeToDocker(context.Background(), paths, options); handled {
+		return dockerErr
+	}
 	if options.BotShortcut != "" {
 		if options.Role != commentbus.RuntimeRoleMain && commentbus.ProfileRE.MatchString(options.BotShortcut) {
 			profile, profileErr := resolveAgentProfileRunShortcut(paths, options.BotShortcut)
@@ -453,7 +456,20 @@ func defaultRunRuntimeCommand(options runtimeRunOptions) (err error) {
 	// and the transient path. Non-fatal: the launch proceeds and the runtime
 	// prompts as needed. runtimeAuthState is a no-op for an empty/unknown runtime.
 	if authed, hint := runtimeAuthState(options.Runtime); !authed {
-		fmt.Fprintf(os.Stderr, "Heads-up: %s\n", hint)
+		// For an interactive, attached launch render the full readiness panel so
+		// the "log in to a coding agent" step is impossible to miss. Headless /
+		// detached launches (COMMENT_IO_SKIP_ATTACH, --detach) keep the single
+		// stderr line so service logs aren't flooded with an ANSI box redraw on
+		// every cold start.
+		if !shouldSkipRuntimeAttach(options) && isTerminalFile(os.Stderr) {
+			// Scope the panel to the runtime about to launch so it never reports
+			// "ready" about a different runtime than the one that's logged out.
+			rd := gatherReadiness(paths)
+			rd.focusRuntime = options.Runtime
+			renderReadinessBox(os.Stderr, rd, colorEnabled(os.Stderr))
+		} else {
+			fmt.Fprintf(os.Stderr, "Heads-up: %s\n", hint)
+		}
 	}
 	var startResult runtimeStartResult
 	if options.Role == "" || options.Role == commentbus.RuntimeRoleMain {

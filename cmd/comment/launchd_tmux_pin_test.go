@@ -141,6 +141,45 @@ func TestInstalledServicePersistsTmuxPin(t *testing.T) {
 	}
 }
 
+func TestInstalledServicePersistsNpmPin(t *testing.T) {
+	npm := filepath.Join(t.TempDir(), "npm")
+	if err := os.WriteFile(npm, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(npm))
+	t.Setenv(autoUpdateNpmBinaryEnv, "")
+
+	pin := installNpmBinaryPin()
+	if pin != npm {
+		t.Fatalf("installNpmBinaryPin() = %q, want %q", pin, npm)
+	}
+
+	plist := buildLaunchAgentPlist(launchAgentConfig{
+		Label:            "io.comment.test",
+		Home:             "/home/.comment-io",
+		NpmBinary:        pin,
+		ProgramArguments: []string{"/usr/local/bin/comment", "bus", "run"},
+	})
+	if !strings.Contains(plist, autoUpdateNpmBinaryEnv) || !strings.Contains(plist, pin) {
+		t.Fatalf("launchd plist missing npm pin env:\n%s", plist)
+	}
+
+	unit := buildSystemdUnit(systemdServiceConfig{
+		Label:            "io.comment.test",
+		UnitName:         "io.comment.test.service",
+		Home:             "/home/.comment-io",
+		NpmBinary:        pin,
+		BinaryPath:       "/usr/local/bin/comment",
+		UnitPath:         "/home/.config/systemd/user/io.comment.test.service",
+		StdoutPath:       "/home/.comment-io/logs/out.log",
+		StderrPath:       "/home/.comment-io/logs/err.log",
+		ProgramArguments: []string{"/usr/local/bin/comment", "bus", "run"},
+	})
+	if !strings.Contains(unit, autoUpdateNpmBinaryEnv+"="+pin) {
+		t.Fatalf("systemd unit missing npm pin env:\n%s", unit)
+	}
+}
+
 // Without an explicit absolute pin, the service must not write a tmux env var —
 // the daemon falls back to trusted-directory auto-discovery. Bare names and the
 // "tmux" default are not persisted.

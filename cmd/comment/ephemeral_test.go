@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -63,6 +64,17 @@ func TestEphemeralEnsureMintThenReuse(t *testing.T) {
 	if mode(t, cred) != 0o600 {
 		t.Fatalf("cred mode = %v, want 0600", mode(t, cred))
 	}
+	var stored ephemeralCred
+	data, err := os.ReadFile(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.IdentityClass != "ethereal" {
+		t.Fatalf("cred identity_class = %q, want ethereal", stored.IdentityClass)
+	}
 	if b, _ := os.ReadFile(filepath.Join(home, "rewake", "bind-sess1")); strings.TrimSpace(string(b)) != "max.e-abcd1234" {
 		t.Fatalf("bind pointer = %q, want max.e-abcd1234", strings.TrimSpace(string(b)))
 	}
@@ -75,6 +87,293 @@ func TestEphemeralEnsureMintThenReuse(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("reuse minted again: calls = %d, want 1", calls)
+	}
+}
+
+func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
+	clearEphemeralEnv(t)
+	const base = "https://comment.io"
+
+	cases := []struct {
+		name        string
+		bindHandle  string
+		fileHandle  string
+		credHandle  string
+		credSession string
+		secret      string
+		identity    string
+	}{
+		{
+			name:        "foreign session",
+			bindHandle:  "max.e-aaaa1111",
+			fileHandle:  "max.e-aaaa1111",
+			credHandle:  "max.e-aaaa1111",
+			credSession: "sess_old",
+			secret:      "as_ag_t_secret",
+			identity:    "ethereal",
+		},
+		{
+			name:        "json handle mismatch",
+			bindHandle:  "max.e-bbbb2222",
+			fileHandle:  "max.e-bbbb2222",
+			credHandle:  "max.e-cccc3333",
+			credSession: "sess_new",
+			secret:      "as_ag_t_secret",
+			identity:    "ethereal",
+		},
+		{
+			name:        "registered-looking handle",
+			bindHandle:  "max.reviewer",
+			fileHandle:  "max.reviewer",
+			credHandle:  "max.reviewer",
+			credSession: "sess_new",
+			secret:      "as_ag_t_secret",
+			identity:    "ethereal",
+		},
+		{
+			name:        "dot-e registered-looking nonhex handle",
+			bindHandle:  "max.e-reviewer",
+			fileHandle:  "max.e-reviewer",
+			credHandle:  "max.e-reviewer",
+			credSession: "sess_new",
+			secret:      "as_ag_t_secret",
+			identity:    "ethereal",
+		},
+		{
+			name:        "hex-shaped unmarked registered-looking handle",
+			bindHandle:  "max.e-deadbeef",
+			fileHandle:  "max.e-deadbeef",
+			credHandle:  "max.e-deadbeef",
+			credSession: "sess_new",
+			secret:      "as_ag_t_secret",
+		},
+		{
+			name:        "invalid secret",
+			bindHandle:  "max.e-dddd4444",
+			fileHandle:  "max.e-dddd4444",
+			credHandle:  "max.e-dddd4444",
+			credSession: "sess_new",
+			secret:      "not-secret",
+			identity:    "ethereal",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			etherealDir := filepath.Join(home, "ethereal")
+			rewakeDir := filepath.Join(home, "rewake")
+			if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(rewakeDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cred := ephemeralCred{
+				Handle:        tc.credHandle,
+				AgentSecret:   tc.secret,
+				IdentityClass: tc.identity,
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       tc.credSession,
+			}
+			data, err := json.Marshal(cred)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(etherealDir, tc.fileHandle+".json"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			bindFile := filepath.Join(rewakeDir, "bind-sess_new")
+			if err := os.WriteFile(bindFile, []byte(tc.bindHandle), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if c, p, ok := ephemeralTryReuse(etherealDir, bindFile, "sess_new", base); ok {
+				t.Fatalf("reused invalid credential: cred=%+v path=%s", c, p)
+			}
+		})
+	}
+}
+
+func TestEphemeralEnsureRejectsBareRawResponseCred(t *testing.T) {
+	clearEphemeralEnv(t)
+	home := t.TempDir()
+	etherealDir := filepath.Join(home, "ethereal")
+	rewakeDir := filepath.Join(home, "rewake")
+	if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rewakeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the raw POST /agents/ephemeral response shape. Without the helper's
+	// session/base/identity metadata, it is only a bearer token, not a reachable
+	// session-scoped identity that `ensure` may safely reclaim.
+	rawCred := `{"agent_id":"ag_t","agent_secret":"as_ag_t_old","handle":"max.e-deadbeef","actor_id":"ai:max.e-deadbeef","display_name":"Fred","expires_at":"2999-01-01T00:00:00.000Z","owner":"max"}`
+	if err := os.WriteFile(filepath.Join(etherealDir, "max.e-deadbeef.json"), []byte(rawCred), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rewakeDir, "bind-sess_raw"), []byte("max.e-deadbeef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	srv := mintServer(t, &calls, `{"handle":"max.e-cafebabe","agent_secret":"as_ag_t_new","expires_at":"2999-01-01T00:00:00.000Z","owner":"max"}`)
+	t.Setenv("COMMENT_IO_ARK_KEY", "ark_test")
+	if err := runEphemeralEnsure([]string{"--home", home, "--base-url", srv.URL, "--session", "sess_raw"}); err != nil {
+		t.Fatalf("ensure returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("bare raw response cred was reused; mint calls = %d, want 1", calls)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rewakeDir, "bind-sess_raw")); strings.TrimSpace(string(b)) != "max.e-cafebabe" {
+		t.Fatalf("bind pointer = %q, want reminted max.e-cafebabe", strings.TrimSpace(string(b)))
+	}
+	var stored ephemeralCred
+	data, err := os.ReadFile(filepath.Join(etherealDir, "max.e-cafebabe.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.IdentityClass != "ethereal" || stored.Session != "sess_raw" || stored.BaseURL == "" {
+		t.Fatalf("reminted cred missing reuse metadata: %+v", stored)
+	}
+}
+
+func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
+	clearEphemeralEnv(t)
+	const (
+		base   = "https://comment.io"
+		handle = "max.e-feedc0de"
+		sess   = "sess_new"
+	)
+
+	cases := []struct {
+		name        string
+		cred        ephemeralCred
+		wantOK      bool
+		wantMigrate bool
+	}{
+		{
+			name: "marked ethereal",
+			cred: ephemeralCred{
+				Handle:        handle,
+				AgentSecret:   "as_ag_t_secret",
+				IdentityClass: "ethereal",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       sess,
+			},
+			wantOK: true,
+		},
+		{
+			name: "legacy markerless daemon mint is migrated",
+			cred: ephemeralCred{
+				Handle:      handle,
+				AgentSecret: "as_ag_t_secret",
+				ExpiresAt:   "2999-01-01T00:00:00.000Z",
+				BaseURL:     base,
+				Session:     sess,
+			},
+			wantOK:      true,
+			wantMigrate: true,
+		},
+		{
+			name: "json handle mismatch",
+			cred: ephemeralCred{
+				Handle:        "max.e-deadbeef",
+				AgentSecret:   "as_ag_t_secret",
+				IdentityClass: "ethereal",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       sess,
+			},
+		},
+		{
+			name: "wrong session",
+			cred: ephemeralCred{
+				Handle:        handle,
+				AgentSecret:   "as_ag_t_secret",
+				IdentityClass: "ethereal",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       "sess_old",
+			},
+		},
+		{
+			name: "bad secret",
+			cred: ephemeralCred{
+				Handle:        handle,
+				AgentSecret:   "not-secret",
+				IdentityClass: "ethereal",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       sess,
+			},
+		},
+		{
+			name: "standard marker",
+			cred: ephemeralCred{
+				Handle:        handle,
+				AgentSecret:   "as_ag_t_secret",
+				IdentityClass: "standard",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       sess,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			etherealDir := filepath.Join(home, "ethereal")
+			bindFile := filepath.Join(home, "rewake", "bind-"+sess)
+			if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(bindFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(tc.cred)
+			if err != nil {
+				t.Fatal(err)
+			}
+			credPath := filepath.Join(etherealDir, handle+".json")
+			if err := os.WriteFile(credPath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cred, path, ok := ephemeralAcceptDaemonMintedCred(etherealDir, bindFile, handle, sess, base)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (cred=%+v path=%s)", ok, tc.wantOK, cred, path)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if path != credPath || cred.Handle != handle {
+				t.Fatalf("accepted cred/path = %+v / %s", cred, path)
+			}
+			if b, _ := os.ReadFile(bindFile); strings.TrimSpace(string(b)) != handle {
+				t.Fatalf("bind = %q, want %s", strings.TrimSpace(string(b)), handle)
+			}
+			if tc.wantMigrate {
+				var migrated ephemeralCred
+				data, err := os.ReadFile(credPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(data, &migrated); err != nil {
+					t.Fatal(err)
+				}
+				if migrated.IdentityClass != "ethereal" {
+					t.Fatalf("migrated identity_class = %q, want ethereal", migrated.IdentityClass)
+				}
+			}
+		})
 	}
 }
 

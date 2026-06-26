@@ -116,6 +116,8 @@ func run(args []string) error {
 		return runPlugin(args[1:])
 	case "doctor":
 		return runDoctor(args[1:])
+	case "status":
+		return runStatus(args[1:])
 	case "sync":
 		return runSync(args[1:])
 	case "botlets":
@@ -487,6 +489,12 @@ func runDaemonWithContext(ctx context.Context, home string, botletsHome string, 
 		TCPListenAddr:             strings.TrimSpace(os.Getenv("COMMENT_IO_BUS_TCP_LISTEN")),
 		AllowNonLoopbackTCP:       os.Getenv("COMMENT_IO_BUS_TCP_ALLOW_NONLOOPBACK") == "1",
 		DisableUnixListener:       os.Getenv("COMMENT_IO_BUS_DISABLE_UNIX") == "1",
+		// Mention-driven auto-launch reuses the EXACT detached launch the web
+		// "Start your agent" button and the runtime-request worker use, so a bot
+		// that opted into "Responds to @mentions" replies without a manual
+		// `comment run`. The helper lives in package main; inject it into the
+		// daemon (which lives in package commentbus and can't import it).
+		MentionAutoStart: launchAgentRuntimeDetached,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {

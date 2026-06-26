@@ -189,6 +189,7 @@ func (w *agentRuntimeRequestWorker) listRequests(ctx context.Context, auth comme
 	}
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("X-Comment-CLI-Version", version)
+	req.Header.Set(runtimeAuthHeaderName, runtimeAuthHeaderValue())
 	req.Header.Set(runtimeRequestCapabilityHeader, runtimeRequestCapability)
 	resp, err := runtimeRequestHTTPClient.Do(req)
 	if err != nil {
@@ -259,6 +260,7 @@ func (w *agentRuntimeRequestWorker) postRuntimeRequestAck(ctx context.Context, a
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("X-Comment-CLI-Version", version)
+	req.Header.Set(runtimeAuthHeaderName, runtimeAuthHeaderValue())
 	req.Header.Set(runtimeRequestCapabilityHeader, runtimeRequestCapability)
 	resp, err := runtimeRequestHTTPClient.Do(req)
 	if err != nil {
@@ -273,7 +275,14 @@ func (w *agentRuntimeRequestWorker) postRuntimeRequestAck(ctx context.Context, a
 // `comment run <handle>` with COMMENT_IO_SKIP_ATTACH=1, which tells the bus
 // daemon to start the managed session and returns promptly. A clean exit means
 // the session started; a non-zero exit (captured output) is the failure detail.
-func launchAgentRuntimeDetached(ctx context.Context, _ commentbus.Paths, handle string) error {
+//
+// Both callers (the web "Start your agent" runtime-request worker and the
+// mention-driven auto-launch) pass the daemon's resolved Paths; the launched
+// `comment run` is pinned to paths.Home via COMMENT_IO_HOME so it resolves the
+// SAME home/profiles/socket the daemon holds — even when the daemon was started
+// as `comment bus run --home /custom` (a custom home set by flag, not via the
+// COMMENT_IO_HOME env var the bare process inherits).
+func launchAgentRuntimeDetached(ctx context.Context, paths commentbus.Paths, handle string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("could not resolve the comment binary: %w", err)
@@ -281,9 +290,7 @@ func launchAgentRuntimeDetached(ctx context.Context, _ commentbus.Paths, handle 
 	launchCtx, cancel := context.WithTimeout(ctx, runtimeRequestLaunchTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(launchCtx, exe, "run", handle)
-	// Inherit the daemon's environment (COMMENT_IO_HOME etc.) so the runtime
-	// resolves the same profiles/home, and force the no-attach start path.
-	cmd.Env = append(os.Environ(), "COMMENT_IO_SKIP_ATTACH=1")
+	cmd.Env = agentRuntimeLaunchEnv(paths)
 	cmd.Stdin = nil
 	var out strings.Builder
 	cmd.Stdout = &out
@@ -299,6 +306,75 @@ func launchAgentRuntimeDetached(ctx context.Context, _ commentbus.Paths, handle 
 		return errors.New(msg)
 	}
 	return nil
+}
+
+// agentRuntimeLaunchEnv builds the environment for the detached `comment run`.
+// It inherits the daemon's process environment, then forces COMMENT_IO_SKIP_ATTACH
+// (no-attach start) and pins COMMENT_IO_HOME to the daemon's resolved home so a
+// flag-set `--home` (which never lands in the inherited env) still reaches the
+// launched runtime. A zero-value/empty home leaves the inherited COMMENT_IO_HOME
+// (if any) untouched — the launched process falls back to the same default cascade
+// the daemon used, so the runtime-request path with a bare Paths is unaffected.
+//
+// When we DO pin a home we also reconcile COMMENT_IO_BUS_TCP_ADDR to the daemon's
+// OWN resolved dial address (paths.BusTCPAddr). That env var is the only bus-address
+// override resolveCLIPaths keys off the home: it applies the dial address whenever
+// the resolved COMMENT_IO_HOME matches the target home. We must keep the child
+// dialing THIS daemon for the pinned home, and there are two cases:
+//
+//   - TCP daemon (paths.BusTCPAddr set, e.g. COMMENT_IO_BUS_DISABLE_UNIX=1 / a
+//     caged deployment with no Unix socket): the TCP dial address is the ONLY way to
+//     reach the bus. We SET COMMENT_IO_BUS_TCP_ADDR to paths.BusTCPAddr — the
+//     daemon's actual dial address for the home it itself resolved — overriding any
+//     stale inherited value from a DIFFERENT caged daemon. Unconditionally stripping
+//     here would leave the child with no dial address, falling back to a nonexistent
+//     Unix socket and breaking auto-start in TCP-only/caged deployments.
+//   - Pure Unix daemon (paths.BusTCPAddr empty): the child reaches the pinned home
+//     via its Unix socket, so we STRIP any inherited COMMENT_IO_BUS_TCP_ADDR — it
+//     belongs to a parent's home and resolveCLIPaths would otherwise re-apply it to
+//     the freshly pinned home, dialing the wrong daemon.
+//
+// With no home to pin we touch neither var, so the bare-Paths runtime-request case
+// (the round-6 zero-value path) is unaffected.
+func agentRuntimeLaunchEnv(paths commentbus.Paths) []string {
+	home := strings.TrimSpace(paths.Home)
+	busTCPAddr := strings.TrimSpace(paths.BusTCPAddr)
+	base := os.Environ()
+	out := make([]string, 0, len(base)+3)
+	for _, entry := range base {
+		key := entry
+		if idx := strings.IndexRune(entry, '='); idx >= 0 {
+			key = entry[:idx]
+		}
+		if key == "COMMENT_IO_SKIP_ATTACH" {
+			continue
+		}
+		// Drop any inherited COMMENT_IO_HOME so the daemon's resolved home (set
+		// below) is authoritative; keep it only when we have no home to pin.
+		if key == "COMMENT_IO_HOME" && home != "" {
+			continue
+		}
+		// When pinning a home, drop the inherited bus dial address so we can replace
+		// it below with the daemon's own (TCP daemon) or leave it stripped (Unix
+		// daemon). Either way the inherited value belongs to the parent's home and
+		// resolveCLIPaths would otherwise re-apply it to the newly pinned home.
+		if key == "COMMENT_IO_BUS_TCP_ADDR" && home != "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out, "COMMENT_IO_SKIP_ATTACH=1")
+	if home != "" {
+		out = append(out, "COMMENT_IO_HOME="+home)
+		// A TCP-only daemon (no Unix socket) is reachable ONLY via its dial address,
+		// so pin the child to THIS daemon's address (paths.BusTCPAddr). For a pure
+		// Unix daemon paths.BusTCPAddr is empty and the inherited address stays
+		// stripped (above), so the child uses the pinned home's Unix socket.
+		if busTCPAddr != "" {
+			out = append(out, "COMMENT_IO_BUS_TCP_ADDR="+busTCPAddr)
+		}
+	}
+	return out
 }
 
 func (w *agentRuntimeRequestWorker) logInfo(msg string, data map[string]any) {

@@ -51,8 +51,9 @@ const (
 	// agentEnrollmentPairingRecheckInterval is how often the worker re-reads
 	// daemon-auth.json while unpaired or after its token was revoked.
 	agentEnrollmentPairingRecheckInterval = 30 * time.Second
-	// agentEnrollmentBackoffCap bounds the exponential backoff applied on
-	// repeated poll errors (network / 5xx). Reset on the first success.
+	// agentEnrollmentBackoffCap bounds the exponential backoff applied both to
+	// repeated list-poll errors (network / 5xx) and to per-enrollment re-redeem
+	// retries. Each counter resets independently on its first success.
 	agentEnrollmentBackoffCap     = 60 * time.Second
 	agentEnrollmentRequestTimeout = 30 * time.Second
 )
@@ -86,7 +87,8 @@ func runAgentEnrollmentWorker(ctx context.Context, paths commentbus.Paths, botle
 }
 
 // agentEnrollmentWorker carries the mutable poll state between passes: the
-// last list ETag, the consecutive poll-error count driving backoff, and the
+// last list ETag, the consecutive poll-error count driving backoff, the
+// consecutive per-enrollment retry count driving re-redeem backoff, and the
 // exact token observed revoked (so a re-pair with a fresh token resumes
 // polling immediately while the dead token stays parked).
 type agentEnrollmentWorker struct {
@@ -94,16 +96,54 @@ type agentEnrollmentWorker struct {
 	// botletsHomeHint is the daemon's --botlets-home value, plumbed through so
 	// Botlets enrollment installs resolve the SAME home the running daemon
 	// loaded profiles from (resolveDaemonBotletsHome).
-	botletsHomeHint   string
-	etag              string
-	pollFailures      int
+	botletsHomeHint string
+	etag            string
+	pollFailures    int
+	// enrollFailures / enrollNextAttempt throttle the per-enrollment RE-REDEEM
+	// cadence, keyed by enrollment_id. Each re-redeem makes the server revoke the
+	// prior credential and mint a fresh one, so a persistently-stuck enrollment
+	// (verify 5xx, install failure, …) re-redeeming every 4s poll is the churn
+	// behind #1321. On a retryable failure we record a per-enrollment exponential
+	// backoff (base poll interval, doubling, capped) and SKIP re-redeeming that
+	// enrollment until it elapses. The list poll itself stays at the base cadence
+	// so a brand-new or healthy enrollment is never delayed by an unrelated stuck
+	// one. Entries are cleared when the enrollment succeeds, drops off the list,
+	// or the daemon token is revoked / unpaired. Distinct from pollFailures (the
+	// LIST-call backoff), which list-success resets every poll.
+	enrollFailures    map[string]int
+	enrollNextAttempt map[string]time.Time
+	// nowFn is the clock used for backoff gating; overridden in tests.
+	nowFn             func() time.Time
 	revokedToken      string
 	loggedAuthBroken  bool
 	loggedAuthRevoked bool
 }
 
 func newAgentEnrollmentWorker(paths commentbus.Paths) *agentEnrollmentWorker {
-	return &agentEnrollmentWorker{paths: paths}
+	return &agentEnrollmentWorker{
+		paths:             paths,
+		enrollFailures:    map[string]int{},
+		enrollNextAttempt: map[string]time.Time{},
+		nowFn:             time.Now,
+	}
+}
+
+// resetEnrollRetry forgets all per-enrollment re-redeem backoff state (used when
+// the daemon unpairs or its token is revoked — a fresh pairing starts clean).
+func (w *agentEnrollmentWorker) resetEnrollRetry() {
+	w.enrollFailures = map[string]int{}
+	w.enrollNextAttempt = map[string]time.Time{}
+}
+
+// pruneEnrollRetry drops backoff state for enrollments no longer on the list
+// (terminal / cancelled / drained), bounding the maps to live enrollments.
+func (w *agentEnrollmentWorker) pruneEnrollRetry(seen map[string]bool) {
+	for id := range w.enrollFailures {
+		if !seen[id] {
+			delete(w.enrollFailures, id)
+			delete(w.enrollNextAttempt, id)
+		}
+	}
 }
 
 type agentEnrollmentListItem struct {
@@ -151,7 +191,12 @@ type agentEnrollmentBotletsHint struct {
 	// Optional: older servers omit it and the registry falls back to the
 	// default timezone.
 	ScheduleTimezone string `json:"schedule_timezone"`
-	Brain            struct {
+	// RespondsToMentions is the bot's "Responds to @mentions" opt-in, mirrored
+	// into the local registry entry so the daemon can auto-launch the runtime on
+	// a doc @mention. Optional: a server that omits it (false) leaves the bot in
+	// the default no-auto-launch state.
+	RespondsToMentions bool `json:"responds_to_mentions"`
+	Brain              struct {
 		WorkspaceID     string `json:"workspace_id"`
 		BotID           string `json:"bot_id"`
 		BotAgentID      string `json:"bot_agent_id"`
@@ -179,11 +224,12 @@ func (w *agentEnrollmentWorker) runOnce(ctx context.Context) time.Duration {
 	}
 	if !paired {
 		w.loggedAuthBroken = false
-		// Unpaired: no-op cleanly, and forget any prior revoked-token latch so
-		// a future pairing starts fresh.
+		// Unpaired: no-op cleanly, and forget any prior revoked-token latch and
+		// per-enrollment backoff state so a future pairing starts fresh.
 		w.revokedToken = ""
 		w.loggedAuthRevoked = false
 		w.etag = ""
+		w.resetEnrollRetry()
 		return agentEnrollmentPairingRecheckInterval
 	}
 	if strings.TrimSpace(auth.BaseURL) == "" {
@@ -217,6 +263,7 @@ func (w *agentEnrollmentWorker) runOnce(ctx context.Context) time.Duration {
 		w.revokedToken = auth.Token
 		w.etag = ""
 		w.pollFailures = 0
+		w.resetEnrollRetry()
 		if !w.loggedAuthRevoked {
 			w.loggedAuthRevoked = true
 			w.logWarn("agent_enrollment.daemon_token_revoked", map[string]any{
@@ -245,6 +292,9 @@ func (w *agentEnrollmentWorker) runOnce(ctx context.Context) time.Duration {
 	// the worst case is one extra full fetch that self-heals once the item
 	// reaches a terminal state.
 	retryWanted := false
+	deferred := false
+	now := w.nowFn()
+	seen := make(map[string]bool, len(items)+len(cleanups))
 	for _, item := range items {
 		if ctx.Err() != nil {
 			return agentEnrollmentPollInterval
@@ -256,41 +306,75 @@ func (w *agentEnrollmentWorker) runOnce(ctx context.Context) time.Duration {
 		if item.State != "pending" && item.State != "redeemed" {
 			continue
 		}
+		seen[item.EnrollmentID] = true
+		// Skip re-redeeming an enrollment still inside its per-enrollment backoff
+		// window: each re-redeem churns a server credential (#1321). The list poll
+		// keeps its base cadence below, so this throttles ONLY the stuck item —
+		// new/healthy enrollments are processed immediately.
+		if next, backedOff := w.enrollNextAttempt[item.EnrollmentID]; backedOff && now.Before(next) {
+			deferred = true
+			continue
+		}
 		if w.processEnrollment(ctx, auth, item) {
 			retryWanted = true
+			w.enrollFailures[item.EnrollmentID]++
+			// The first failure retries at the normal poll cadence — a one-off
+			// transient blip shouldn't be slowed. Only a REPEATED failure arms the
+			// per-enrollment backoff that throttles the re-redeem churn of #1321.
+			if w.enrollFailures[item.EnrollmentID] > 1 {
+				w.enrollNextAttempt[item.EnrollmentID] = now.Add(agentEnrollmentExpBackoff(w.enrollFailures[item.EnrollmentID]))
+			}
+		} else {
+			// Settled (installed or terminal): clear its backoff so a future
+			// re-enrollment under the same id starts at the fast cadence.
+			delete(w.enrollFailures, item.EnrollmentID)
+			delete(w.enrollNextAttempt, item.EnrollmentID)
 		}
 	}
 	// `cleanups`: redeemed-then-terminal enrollments whose terminal answer this
 	// daemon never heard (the cancel/sweep landed while it was stopped). Each
 	// is reconciled with the same restore-or-remove cleanup the terminal-ack
 	// path runs, then re-acked so the server stamps the confirmation that
-	// drains the item.
+	// drains the item. Cleanups don't re-redeem, so they are not backoff-gated.
 	for _, item := range cleanups {
 		if ctx.Err() != nil {
 			return agentEnrollmentPollInterval
 		}
+		seen[item.EnrollmentID] = true
 		if w.processCleanup(ctx, auth, item) {
 			retryWanted = true
 		}
 	}
-	if retryWanted {
+	w.pruneEnrollRetry(seen)
+	if retryWanted || deferred {
+		// Force a full re-fetch next poll: a retried item left the list
+		// fingerprint (enrollment_id:state:credential_id) unchanged so it would
+		// 304 forever, and a deferred item must reappear so we can re-redeem it
+		// once its backoff elapses. Clearing is always safe — the worst case is
+		// one extra full fetch that self-heals once the item reaches a terminal
+		// state. The poll cadence itself stays fast so concurrent new/healthy
+		// enrollments are never delayed by a stuck one.
 		w.etag = ""
 	}
 	return agentEnrollmentPollInterval
 }
 
-func (w *agentEnrollmentWorker) backoffWait() time.Duration {
+// agentEnrollmentExpBackoff maps a consecutive-failure count to an exponential
+// wait (base poll interval, doubling) capped at agentEnrollmentBackoffCap. A
+// count of 0 or 1 returns the base interval, so the first failure is not slowed.
+func agentEnrollmentExpBackoff(failures int) time.Duration {
 	wait := agentEnrollmentPollInterval
-	for i := 1; i < w.pollFailures; i++ {
+	for i := 1; i < failures && wait < agentEnrollmentBackoffCap; i++ {
 		wait *= 2
-		if wait >= agentEnrollmentBackoffCap {
-			return agentEnrollmentBackoffCap
-		}
 	}
 	if wait > agentEnrollmentBackoffCap {
 		return agentEnrollmentBackoffCap
 	}
 	return wait
+}
+
+func (w *agentEnrollmentWorker) backoffWait() time.Duration {
+	return agentEnrollmentExpBackoff(w.pollFailures)
 }
 
 // listEnrollments performs the fast poll. A 304 (ETag unchanged) returns no
@@ -305,6 +389,7 @@ func (w *agentEnrollmentWorker) listEnrollments(ctx context.Context, auth commen
 	}
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("X-Comment-CLI-Version", version)
+	req.Header.Set(runtimeAuthHeaderName, runtimeAuthHeaderValue())
 	if w.etag != "" {
 		req.Header.Set("If-None-Match", w.etag)
 	}
@@ -794,22 +879,23 @@ func (w *agentEnrollmentWorker) installBotletsEnrollment(ctx context.Context, au
 		})
 	}
 	reg, err := botletsTeamRegisterLocally(ctx, botletsRegisterInput{
-		Paths:            w.paths,
-		BotletsHome:      botletsHome,
-		BaseURL:          baseURL,
-		BotHandle:        handle,
-		AgentSecret:      cred.AgentSecret,
-		BotSlug:          botletsBotSlugFromHandle(handle),
-		BotDisplayName:   redeemed.Agent.DisplayName,
-		BotID:            hint.Brain.BotID,
-		OwnerAgentID:     hint.Brain.OwnerAgentID,
-		BotAgentID:       hint.Brain.BotAgentID,
-		WorkspaceID:      hint.Brain.WorkspaceID,
-		ContainerID:      hint.Brain.ContainerID,
-		RootFolderID:     hint.Brain.RootFolderID,
-		SetupGeneration:  setupGeneration,
-		ScheduleTimezone: strings.TrimSpace(hint.ScheduleTimezone),
-		Runtime:          runtime,
+		Paths:              w.paths,
+		BotletsHome:        botletsHome,
+		BaseURL:            baseURL,
+		BotHandle:          handle,
+		AgentSecret:        cred.AgentSecret,
+		BotSlug:            botletsBotSlugFromHandle(handle),
+		BotDisplayName:     redeemed.Agent.DisplayName,
+		BotID:              hint.Brain.BotID,
+		OwnerAgentID:       hint.Brain.OwnerAgentID,
+		BotAgentID:         hint.Brain.BotAgentID,
+		WorkspaceID:        hint.Brain.WorkspaceID,
+		ContainerID:        hint.Brain.ContainerID,
+		RootFolderID:       hint.Brain.RootFolderID,
+		SetupGeneration:    setupGeneration,
+		ScheduleTimezone:   strings.TrimSpace(hint.ScheduleTimezone),
+		RespondsToMentions: hint.RespondsToMentions,
+		Runtime:            runtime,
 	})
 	if err != nil {
 		// Local Botlets wiring failed after the credential was minted (brain

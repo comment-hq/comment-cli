@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/comment-hq/comment-cli/internal/commentbus"
 )
@@ -27,6 +28,7 @@ type ownedAgentsServerState struct {
 	fingerprints   []string
 	enrolls        []string
 	enrollRuntimes []string
+	enrollCh       chan string
 }
 
 func newOwnedAgentsTestServer(t *testing.T, state *ownedAgentsServerState) *httptest.Server {
@@ -63,6 +65,12 @@ func newOwnedAgentsTestServer(t *testing.T, state *ownedAgentsServerState) *http
 		}
 		state.enrolls = append(state.enrolls, body.AgentID)
 		state.enrollRuntimes = append(state.enrollRuntimes, body.Runtime)
+		if state.enrollCh != nil {
+			select {
+			case state.enrollCh <- body.AgentID:
+			default:
+			}
+		}
 		status := http.StatusCreated
 		if idx := len(state.enrolls) - 1; idx < len(state.enrollStatus) {
 			status = state.enrollStatus[idx]
@@ -74,6 +82,103 @@ func newOwnedAgentsTestServer(t *testing.T, state *ownedAgentsServerState) *http
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server
+}
+
+func TestOwnedAgentsReconcilerRunsFirstPassImmediately(t *testing.T) {
+	paths := testAgentEnrollmentPaths(t)
+	state := &ownedAgentsServerState{
+		responses: []map[string]any{ownedAgentsManifestResponse(
+			"fp_1",
+			ownedAgentsManifestAgentPayload("ag_guy", "max.guy"),
+		)},
+		enrollCh: make(chan string, 1),
+	}
+	server := newOwnedAgentsTestServer(t, state)
+	writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer stopOwnedAgentsReconcilerForTest(t, cancel, done)
+
+	go func() {
+		defer close(done)
+		runOwnedAgentsReconciler(ctx, paths, "")
+	}()
+
+	select {
+	case got := <-state.enrollCh:
+		if got != "ag_guy" {
+			t.Fatalf("first enrollment = %q, want ag_guy", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("owned-agents reconciler did not run an immediate first pass")
+	}
+}
+
+func TestOwnedAgentsReconcilerRetriesPromptlyAfterPairingLands(t *testing.T) {
+	paths := testAgentEnrollmentPaths(t)
+	state := &ownedAgentsServerState{
+		responses: []map[string]any{ownedAgentsManifestResponse(
+			"fp_1",
+			ownedAgentsManifestAgentPayload("ag_guy", "max.guy"),
+		)},
+		enrollCh: make(chan string, 1),
+	}
+	server := newOwnedAgentsTestServer(t, state)
+	worker := newOwnedAgentsReconciler(paths)
+
+	// The immediate startup pass sees the normal installer state: daemon running
+	// but not paired yet. It must ask the scheduler for the short auth retry
+	// cadence from that same observation.
+	if pairedAuth := worker.runOnce(context.Background()); pairedAuth {
+		t.Fatal("unpaired runOnce returned paired auth")
+	}
+	writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
+
+	if pairedAuth := worker.runOnce(context.Background()); !pairedAuth {
+		t.Fatal("paired runOnce did not report paired auth")
+	}
+	if got := strings.Join(state.enrolls, ","); got != "ag_guy" {
+		t.Fatalf("post-pairing enrollment = %q, want ag_guy", got)
+	}
+}
+
+func TestOwnedAgentsReconcilerLoopUsesAuthRetryUntilUsableAuth(t *testing.T) {
+	paths := testAgentEnrollmentPaths(t)
+	state := &ownedAgentsServerState{
+		responses: []map[string]any{ownedAgentsManifestResponse(
+			"fp_1",
+			ownedAgentsManifestAgentPayload("ag_guy", "max.guy"),
+		)},
+		enrollCh: make(chan string, 1),
+	}
+	server := newOwnedAgentsTestServer(t, state)
+	if err := commentbus.SaveDaemonAuth(paths, commentbus.DaemonAuth{
+		DaemonID: "ld_worker-test",
+		Token:    testEnrollmentDaemonToken,
+		Label:    "Worker Test Mac",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer stopOwnedAgentsReconcilerForTest(t, cancel, done)
+
+	go func() {
+		defer close(done)
+		runOwnedAgentsReconcilerWithDelays(ctx, paths, "", time.Hour, 20*time.Millisecond)
+	}()
+
+	waitForOwnedAgentsLogContains(t, paths, "owned_agents.daemon_auth_missing_base_url")
+	writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
+
+	select {
+	case got := <-state.enrollCh:
+		if got != "ag_guy" {
+			t.Fatalf("post-auth enrollment = %q, want ag_guy", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("owned-agents reconciler did not use auth retry delay after unusable auth")
+	}
 }
 
 func ownedAgentsManifestResponse(fingerprint string, agents ...map[string]any) map[string]any {
@@ -110,6 +215,32 @@ func writeInstalledAgentProfile(t *testing.T, paths commentbus.Paths, handle str
 	profile := []byte(`{"handle":"` + handle + `","agent_secret":"as_installed","base_url":"https://comment.io"}` + "\n")
 	if err := os.WriteFile(filepath.Join(agentsDir, handle+".json"), profile, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func stopOwnedAgentsReconcilerForTest(t *testing.T, cancel context.CancelFunc, done <-chan struct{}) {
+	t.Helper()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("owned-agents reconciler did not stop")
+	}
+}
+
+func waitForOwnedAgentsLogContains(t *testing.T, paths commentbus.Paths, needle string) {
+	t.Helper()
+	logPath := filepath.Join(paths.Logs, "commentd.jsonl")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(logPath)
+		if err == nil && strings.Contains(string(data), needle) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for log %q in %s; last err=%v body=%q", needle, logPath, err, data)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -485,10 +616,11 @@ func TestOwnedAgentsReconcilerBotletsKindRequiresRegistryEntry(t *testing.T) {
 }
 
 // writeOwnedAgentsBotletsRegistryDesired writes a registry.json whose single bot
-// carries the managed-session runtime/timezone and brain setup generation, so a
-// test can assert the reconciler re-enrolls when the manifest's DESIRED state
-// diverges from what is installed (Codex round-9).
-func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, runtime, timezone string, setupGeneration int) {
+// carries the managed-session runtime/timezone, the "Responds to @mentions"
+// opt-in, and brain setup generation, so a test can assert the reconciler
+// re-enrolls when the manifest's DESIRED state diverges from what is installed
+// (Codex round-9).
+func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, runtime, timezone string, respondsToMentions bool, setupGeneration int) {
 	t.Helper()
 	if err := os.MkdirAll(botletsHome, 0o700); err != nil {
 		t.Fatal(err)
@@ -501,6 +633,7 @@ func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, r
 			"runtime":  runtime,
 			"timezone": timezone,
 		},
+		"responds_to_mentions": respondsToMentions,
 		"brain_ref": map[string]any{
 			"workspace_id":     "ws_1",
 			"owner_agent_id":   "ag_owner",
@@ -519,13 +652,14 @@ func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, r
 	}
 }
 
-func ownedAgentsManifestBotletsDesiredPayload(agentID, handle, runtime, timezone string, setupGeneration int) map[string]any {
+func ownedAgentsManifestBotletsDesiredPayload(agentID, handle, runtime, timezone string, respondsToMentions bool, setupGeneration int) map[string]any {
 	return map[string]any{
-		"agent_id":          agentID,
-		"handle":            handle,
-		"display_name":      "Bot " + handle,
-		"runtime":           runtime,
-		"schedule_timezone": timezone,
+		"agent_id":             agentID,
+		"handle":               handle,
+		"display_name":         "Bot " + handle,
+		"runtime":              runtime,
+		"schedule_timezone":    timezone,
+		"responds_to_mentions": respondsToMentions,
 		// Brain block mirrors the cf manifest: setup_generation is NESTED here,
 		// alongside the brain ref ids the install records into the registry.
 		"brain": map[string]any{
@@ -587,34 +721,38 @@ func TestOwnedAgentsReconcilerKeepsCodexProfileWhenManifestRuntimeNull(t *testin
 
 func TestOwnedAgentsReconcilerReinstallsOnDesiredStateChange(t *testing.T) {
 	cases := []struct {
-		name           string
-		runtime        string
-		timezone       string
-		setupGen       int
-		brainContainer string
-		ownerAgentID   string
-		botAgentID     string
-		botID          string
-		wantReinstall  bool
+		name               string
+		runtime            string
+		timezone           string
+		respondsToMentions bool
+		setupGen           int
+		brainContainer     string
+		ownerAgentID       string
+		botAgentID         string
+		botID              string
+		wantReinstall      bool
 	}{
-		{name: "in-sync", runtime: "claude", timezone: "America/New_York", setupGen: 3, wantReinstall: false},
-		{name: "runtime-change", runtime: "codex", timezone: "America/New_York", setupGen: 3, wantReinstall: true},
-		{name: "timezone-change", runtime: "claude", timezone: "Europe/Berlin", setupGen: 3, wantReinstall: true},
-		{name: "setup-generation-change", runtime: "claude", timezone: "America/New_York", setupGen: 4, wantReinstall: true},
-		{name: "brain-ref-change", runtime: "claude", timezone: "America/New_York", setupGen: 3, brainContainer: "c_2", wantReinstall: true},
-		{name: "owner-agent-id-change", runtime: "claude", timezone: "America/New_York", setupGen: 3, ownerAgentID: "ag_owner_2", wantReinstall: true},
-		{name: "bot-agent-id-change", runtime: "claude", timezone: "America/New_York", setupGen: 3, botAgentID: "ag_bot_agent_2", wantReinstall: true},
+		{name: "in-sync", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: false},
+		{name: "runtime-change", runtime: "codex", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: true},
+		{name: "timezone-change", runtime: "claude", timezone: "Europe/Berlin", respondsToMentions: true, setupGen: 3, wantReinstall: true},
+		// Toggling "Responds to @mentions" must re-enroll so the local registry's
+		// flag converges and the daemon's mention auto-launch gate reads it.
+		{name: "responds-to-mentions-on", runtime: "claude", timezone: "America/New_York", respondsToMentions: false, setupGen: 3, wantReinstall: true},
+		{name: "setup-generation-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 4, wantReinstall: true},
+		{name: "brain-ref-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, brainContainer: "c_2", wantReinstall: true},
+		{name: "owner-agent-id-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, ownerAgentID: "ag_owner_2", wantReinstall: true},
+		{name: "bot-agent-id-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botAgentID: "ag_bot_agent_2", wantReinstall: true},
 		// bot_id is the immutable durable bot identity, not stored in brain_ref:
 		// a changed manifest bot_id alone must NOT churn a re-enroll for a stable
 		// handle (a different bot is a different handle entirely).
-		{name: "bot-id-change-only", runtime: "claude", timezone: "America/New_York", setupGen: 3, botID: "bot_2", wantReinstall: false},
+		{name: "bot-id-change-only", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botID: "bot_2", wantReinstall: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			paths := testAgentEnrollmentPaths(t)
 			botletsHome := filepath.Join(t.TempDir(), "botlets")
 			payload := ownedAgentsManifestBotletsDesiredPayload(
-				"ag_bot", "max.bot", tc.runtime, tc.timezone, tc.setupGen)
+				"ag_bot", "max.bot", tc.runtime, tc.timezone, tc.respondsToMentions, tc.setupGen)
 			if tc.brainContainer != "" {
 				payload["brain"].(map[string]any)["container_id"] = tc.brainContainer
 			}
@@ -633,8 +771,9 @@ func TestOwnedAgentsReconcilerReinstallsOnDesiredStateChange(t *testing.T) {
 			server := newOwnedAgentsTestServer(t, state)
 			writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
 			writeInstalledAgentProfile(t, paths, "max.bot")
-			// Installed state: runtime claude, NY timezone, setup generation 3.
-			writeOwnedAgentsBotletsRegistryDesired(t, botletsHome, "max.bot", "claude", "America/New_York", 3)
+			// Installed state: runtime claude, NY timezone, responds-to-mentions on,
+			// setup generation 3.
+			writeOwnedAgentsBotletsRegistryDesired(t, botletsHome, "max.bot", "claude", "America/New_York", true, 3)
 			worker := newOwnedAgentsReconciler(paths)
 			worker.botletsHomeHint = botletsHome
 

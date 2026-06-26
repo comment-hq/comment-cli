@@ -113,6 +113,7 @@ type botletsSetupPollResponse struct {
 	SetupGeneration          int      `json:"setup_generation,omitempty"`
 	SetupAttemptID           string   `json:"setup_attempt_id,omitempty"`
 	ScheduleTimezone         string   `json:"schedule_timezone,omitempty"`
+	RespondsToMentions       bool     `json:"responds_to_mentions,omitempty"`
 	Brain                    struct {
 		WorkspaceID  string `json:"workspaceId"`
 		ContainerID  string `json:"containerId"`
@@ -289,24 +290,25 @@ func runBotletsSetup(args []string) (err error) {
 	telemetry.BotSlug = firstNonEmpty(poll.BotSlug, botSlug)
 	telemetry.BotHandle = poll.BotHandle
 	reg, err := registerBotletsBotLocally(ctx, botletsRegisterInput{
-		Paths:            paths,
-		BotletsHome:      botletsHome,
-		BaseURL:          baseURL,
-		BotHandle:        poll.BotHandle,
-		AgentSecret:      poll.AgentSecret,
-		BotSlug:          poll.BotSlug,
-		BotDisplayName:   poll.BotName,
-		BotID:            poll.BotID,
-		SlugAliases:      poll.SlugAliases,
-		HandleAliases:    poll.HandleAliases,
-		OwnerAgentID:     poll.OwnerAgentID,
-		BotAgentID:       poll.BotAgentID,
-		WorkspaceID:      poll.Brain.WorkspaceID,
-		ContainerID:      poll.Brain.ContainerID,
-		RootFolderID:     poll.Brain.RootFolderID,
-		SetupGeneration:  poll.SetupGeneration,
-		ScheduleTimezone: poll.ScheduleTimezone,
-		Runtime:          runtime,
+		Paths:              paths,
+		BotletsHome:        botletsHome,
+		BaseURL:            baseURL,
+		BotHandle:          poll.BotHandle,
+		AgentSecret:        poll.AgentSecret,
+		BotSlug:            poll.BotSlug,
+		BotDisplayName:     poll.BotName,
+		BotID:              poll.BotID,
+		SlugAliases:        poll.SlugAliases,
+		HandleAliases:      poll.HandleAliases,
+		OwnerAgentID:       poll.OwnerAgentID,
+		BotAgentID:         poll.BotAgentID,
+		WorkspaceID:        poll.Brain.WorkspaceID,
+		ContainerID:        poll.Brain.ContainerID,
+		RootFolderID:       poll.Brain.RootFolderID,
+		SetupGeneration:    poll.SetupGeneration,
+		ScheduleTimezone:   poll.ScheduleTimezone,
+		RespondsToMentions: poll.RespondsToMentions,
+		Runtime:            runtime,
 	})
 	if err != nil {
 		return err
@@ -475,6 +477,10 @@ type botletsRegisterInput struct {
 	SetupGeneration  int
 	ScheduleTimezone string
 	Runtime          string
+	// RespondsToMentions mirrors the bot's "Responds to @mentions" opt-in
+	// (owned-agents manifest / enrollment hint) into the registry entry so the
+	// daemon can auto-launch the runtime on a doc @mention. Defaults to false.
+	RespondsToMentions bool
 }
 
 type botletsRegisterResult struct {
@@ -544,7 +550,8 @@ func registerBotletsBotLocally(ctx context.Context, in botletsRegisterInput) (bo
 			RelativePath:    projection.RelativePath,
 			SetupGeneration: in.SetupGeneration,
 		},
-		ManagedSession: commentbus.ManagedSessionSetting{Enabled: true, Runtime: in.Runtime, Timezone: in.ScheduleTimezone},
+		ManagedSession:     commentbus.ManagedSessionSetting{Enabled: true, Runtime: in.Runtime, Timezone: in.ScheduleTimezone},
+		RespondsToMentions: in.RespondsToMentions,
 	}
 	var aliasWrites []botletsAgentProfileAliasWrite
 	extraProfiles := map[string]commentbus.AgentProfile{profileWrite.profile.Handle: profileWrite.profile}
@@ -606,6 +613,7 @@ func runBotletsRegister(args []string) error {
 	setupGenerationFlag := fs.Int("setup-generation", 0, "brain setup generation (>= 1)")
 	displayNameFlag := fs.String("display-name", "", "bot display name")
 	timezoneFlag := fs.String("timezone", "", "schedule timezone")
+	respondsToMentionsFlag := fs.Bool("responds-to-mentions", false, "auto-launch the bot's runtime on a doc @mention")
 	runtimeFlag := fs.String("runtime", "claude", "managed runtime (claude or codex)")
 	secretFlag := fs.String("secret", "", "agent secret (prefer --secret-stdin)")
 	secretStdin := fs.Bool("secret-stdin", false, "read the agent secret from stdin")
@@ -679,24 +687,25 @@ func runBotletsRegister(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	reg, err := registerBotletsBotLocally(ctx, botletsRegisterInput{
-		Paths:            paths,
-		BotletsHome:      botletsHome,
-		BaseURL:          baseURL,
-		BotHandle:        handle,
-		AgentSecret:      secret,
-		BotSlug:          botSlug,
-		BotDisplayName:   strings.TrimSpace(*displayNameFlag),
-		BotID:            strings.TrimSpace(*botIDFlag),
-		SlugAliases:      splitBotletsAliasList(*slugAliasFlag),
-		HandleAliases:    splitBotletsAliasList(*handleAliasFlag),
-		OwnerAgentID:     strings.TrimSpace(*ownerAgentIDFlag),
-		BotAgentID:       strings.TrimSpace(*botAgentIDFlag),
-		WorkspaceID:      strings.TrimSpace(*workspaceIDFlag),
-		ContainerID:      strings.TrimSpace(*containerIDFlag),
-		RootFolderID:     strings.TrimSpace(*rootFolderIDFlag),
-		SetupGeneration:  *setupGenerationFlag,
-		ScheduleTimezone: strings.TrimSpace(*timezoneFlag),
-		Runtime:          runtime,
+		Paths:              paths,
+		BotletsHome:        botletsHome,
+		BaseURL:            baseURL,
+		BotHandle:          handle,
+		AgentSecret:        secret,
+		BotSlug:            botSlug,
+		BotDisplayName:     strings.TrimSpace(*displayNameFlag),
+		BotID:              strings.TrimSpace(*botIDFlag),
+		SlugAliases:        splitBotletsAliasList(*slugAliasFlag),
+		HandleAliases:      splitBotletsAliasList(*handleAliasFlag),
+		OwnerAgentID:       strings.TrimSpace(*ownerAgentIDFlag),
+		BotAgentID:         strings.TrimSpace(*botAgentIDFlag),
+		WorkspaceID:        strings.TrimSpace(*workspaceIDFlag),
+		ContainerID:        strings.TrimSpace(*containerIDFlag),
+		RootFolderID:       strings.TrimSpace(*rootFolderIDFlag),
+		SetupGeneration:    *setupGenerationFlag,
+		ScheduleTimezone:   strings.TrimSpace(*timezoneFlag),
+		RespondsToMentions: *respondsToMentionsFlag,
+		Runtime:            runtime,
 	})
 	if err != nil {
 		return err
@@ -1087,7 +1096,13 @@ func resyncBotletsTeamManifest(ctx context.Context, client *http.Client, paths c
 			// older servers omit it and the registry falls back to the
 			// default timezone.
 			ScheduleTimezone string `json:"schedule_timezone"`
-			Brain            struct {
+			// RespondsToMentions is the bot's "Responds to @mentions" opt-in,
+			// mirrored into the local registry entry so the daemon auto-launches
+			// its runtime on a doc @mention — the same field the individual-bot
+			// enrollment hint and local-setup poll carry. Optional: older servers
+			// omit it and the registry entry defaults to false.
+			RespondsToMentions bool `json:"responds_to_mentions"`
+			Brain              struct {
 				WorkspaceID  string `json:"workspaceId"`
 				ContainerID  string `json:"containerId"`
 				RootFolderID string `json:"rootFolderId"`
@@ -1112,7 +1127,8 @@ func resyncBotletsTeamManifest(ctx context.Context, client *http.Client, paths c
 			BotHandle: a.Handle, AgentSecret: a.AgentSecret, BotSlug: a.BotSlug,
 			BotID: a.BotID, OwnerAgentID: a.OwnerAgentID, BotAgentID: a.BotAgentID,
 			WorkspaceID: a.Brain.WorkspaceID, ContainerID: a.Brain.ContainerID, RootFolderID: a.Brain.RootFolderID,
-			SetupGeneration: gen, ScheduleTimezone: strings.TrimSpace(a.ScheduleTimezone), Runtime: runtime,
+			SetupGeneration: gen, ScheduleTimezone: strings.TrimSpace(a.ScheduleTimezone),
+			RespondsToMentions: a.RespondsToMentions, Runtime: runtime,
 		})
 		if err != nil {
 			// Best-effort per-bot visibility (Phase 9b): mark the binding

@@ -1736,6 +1736,7 @@ if [ "$1" = "bus" ] && [ "$2" = "health" ]; then
   exit 0
 fi
 if [ "$1" = "bus" ] && [ "$2" = "install" ]; then
+  printf "bus install npm=%s\n" "$COMMENT_IO_NPM_BIN" >> "$log_path"
   printf '{"installed":true,"loaded":true}\n'
   exit 0
 fi
@@ -1811,11 +1812,35 @@ exit 1
 	for _, want := range []string{
 		"bus health --home ",
 		"bus install --home " + home + " --botlets-home " + botletsHome + " --bin " + nativeBin,
+		"bus install npm=" + npmBin,
 		"daemon health --home " + home,
 	} {
 		if !strings.Contains(string(commentLogText), want) {
 			t.Fatalf("comment log missing %q:\n%s", want, string(commentLogText))
 		}
+	}
+}
+
+func TestDefaultUpgradePackageFollowsSelectedEnvironment(t *testing.T) {
+	t.Setenv("COMMENT_IO_CLI_PACKAGE", "")
+
+	t.Setenv(commentbus.EnvVar, commentbus.EnvProduction)
+	if got := defaultUpgradePackage(); got != "@comment-io/cli@latest" {
+		t.Fatalf("production default package = %q, want @comment-io/cli@latest", got)
+	}
+
+	t.Setenv(commentbus.EnvVar, commentbus.EnvStaging)
+	if got := defaultUpgradePackage(); got != "@comment-io/cli@staging" {
+		t.Fatalf("staging default package = %q, want @comment-io/cli@staging", got)
+	}
+}
+
+func TestDefaultUpgradePackageOverrideWinsOverEnvironment(t *testing.T) {
+	t.Setenv(commentbus.EnvVar, commentbus.EnvStaging)
+	t.Setenv("COMMENT_IO_CLI_PACKAGE", "@comment-io/cli@canary")
+
+	if got := defaultUpgradePackage(); got != "@comment-io/cli@canary" {
+		t.Fatalf("override package = %q, want @comment-io/cli@canary", got)
 	}
 }
 
@@ -2023,12 +2048,19 @@ func TestValidateUpgradeDaemonVersionRejectsOldDaemon(t *testing.T) {
 
 func TestUpgradeDaemonInstallEnvClearsAmbientBotletsHome(t *testing.T) {
 	t.Setenv("BOTLETS_HOME", "/tmp/ambient-botlets")
-	cleared := upgradeDaemonInstallEnv(upgradeOptions{})
+	cleared := upgradeDaemonInstallEnv(upgradeOptions{}, "/custom/npm")
 	if got := envValue(cleared, "BOTLETS_HOME"); got != "" {
 		t.Fatalf("BOTLETS_HOME = %q, want empty", got)
 	}
-	if env := upgradeDaemonInstallEnv(upgradeOptions{BotletsHome: "/tmp/explicit-botlets"}); env != nil {
-		t.Fatalf("explicit botlets home should preserve default environment handling, got %#v", env)
+	if got := envValue(cleared, autoUpdateNpmBinaryEnv); got != "/custom/npm" {
+		t.Fatalf("%s = %q, want /custom/npm", autoUpdateNpmBinaryEnv, got)
+	}
+	explicit := upgradeDaemonInstallEnv(upgradeOptions{BotletsHome: "/tmp/explicit-botlets"}, "/custom/npm")
+	if got := envValue(explicit, "BOTLETS_HOME"); got != "/tmp/ambient-botlets" {
+		t.Fatalf("explicit botlets home should preserve ambient BOTLETS_HOME, got %q", got)
+	}
+	if got := envValue(explicit, autoUpdateNpmBinaryEnv); got != "/custom/npm" {
+		t.Fatalf("explicit botlets home %s = %q, want /custom/npm", autoUpdateNpmBinaryEnv, got)
 	}
 }
 

@@ -48,6 +48,38 @@ workers actually run; `go install` builds only the binary.)
 See `comment docs` for the full local CLI reference, and
 <https://comment.io/llms.txt> for the agent-facing HTTP API.
 
+## Build the agent sandbox image
+
+Comment.io publishes a prebuilt **agent sandbox** image — the full daemon plus the
+Claude Code and Codex runtimes, running *inside* a container so the agent (which
+executes code, runs tools, and edits files) is isolated from your host. The
+`/setup` "Run in a Docker Image" one-liner pulls it from GHCR.
+
+The build recipe lives in this repo, so you can inspect, customize, and build it
+yourself instead of trusting the prebuilt image. From the repo root:
+
+```bash
+# Build context is the module root; the Dockerfile builds the comment daemon
+# from this source, then layers the agent runtimes on top.
+docker build -f docker/Dockerfile.agent -t comment-agent .
+```
+
+To run it via Compose (handles host UID/GID + volumes for you), first set the
+required host paths — `compose.agent.yml` refuses to start until `COMMENT_DOCS_DIR`
+points at an absolute directory — then bring it up:
+
+```bash
+export COMMENT_DOCS_DIR="$HOME/comment-agent/docs"      # synced docs (required)
+export COMMENT_AGENTS_DIR="$HOME/comment-agent/agents"  # plain-agent profiles (optional)
+mkdir -p "$COMMENT_DOCS_DIR" "$COMMENT_AGENTS_DIR"
+docker compose -f docker/compose.agent.yml up -d --build
+```
+
+See [`docker/README.agent.md`](docker/README.agent.md) for the full environment,
+host/container trust model, pairing, and runtime login — read it before running
+Compose. The prebuilt image and a
+build-it-yourself image are interchangeable — pick whichever you prefer.
+
 ## Not included in this repo
 
 `comment mcp run` (the Model Context Protocol server) needs the separate
