@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -61,6 +62,12 @@ func TestClaudeAuthState(t *testing.T) {
 	if ok, _ := runtimeAuthState("claude"); !ok {
 		t.Fatal("oauthAccount present: want authed")
 	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, hint := runtimeAuthState("claude"); !ok || hint != "" {
+		t.Fatalf("malformed .claude.json: want authed/no hint, got ok=%v hint=%q", ok, hint)
+	}
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"oauthAccount":null}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +76,28 @@ func TestClaudeAuthState(t *testing.T) {
 	}
 	if err := os.Remove(filepath.Join(home, ".claude.json")); err != nil {
 		t.Fatal(err)
+	}
+	credentialsDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialsDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := runtimeAuthState("claude"); !ok {
+		t.Fatal(".claude/.credentials.json present: want authed")
+	}
+	if err := os.WriteFile(filepath.Join(credentialsDir, ".credentials.json"), []byte(`{"subscriptionType":"pro"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := runtimeAuthState("claude"); ok {
+		t.Fatal("metadata-only .claude/.credentials.json: want not-authed")
+	}
+	if err := os.WriteFile(filepath.Join(credentialsDir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := runtimeAuthState("claude"); ok {
+		t.Fatal("empty .claude/.credentials.json: want not-authed")
 	}
 	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
 	if ok, _ := runtimeAuthState("claude"); !ok {
@@ -100,6 +129,112 @@ func TestCodexAuthState(t *testing.T) {
 	}
 	if ok, _ := runtimeAuthState("codex"); ok {
 		t.Fatal("empty access_token: want not-authed")
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"OPENAI_API_KEY":"sk-file"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := runtimeAuthState("codex"); !ok {
+		t.Fatal("OPENAI_API_KEY in auth.json: want authed")
+	}
+}
+
+func TestCodexAuthStateRespectsCODEXHomeOutsideSandbox(t *testing.T) {
+	home := t.TempDir()
+	customCodexHome := filepath.Join(t.TempDir(), "custom-codex")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", customCodexHome)
+	t.Setenv("OPENAI_API_KEY", "")
+	if err := os.MkdirAll(customCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customCodexHome, "auth.json"), []byte(`{"tokens":{"access_token":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, _ := runtimeAuthState("codex"); !ok {
+		t.Fatal("normal codex auth should respect CODEX_HOME")
+	}
+	if ok, _ := runtimeFileAuthState("codex"); ok {
+		t.Fatal("file-backed sandbox codex auth must ignore CODEX_HOME")
+	}
+}
+
+func TestRuntimeFileAuthStateIsStrictForDockerReadiness(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, hint := runtimeAuthState("claude"); !ok || hint != "" {
+		t.Fatalf("normal malformed Claude auth should not nag, got ok=%v hint=%q", ok, hint)
+	}
+	if ok, hint := runtimeFileAuthState("claude"); ok || hint == "" {
+		t.Fatalf("strict malformed Claude auth should not count, got ok=%v hint=%q", ok, hint)
+	} else if !strings.Contains(hint, "claude") || !strings.Contains(hint, "/login") || strings.Contains(hint, "setup-token") {
+		t.Fatalf("strict Docker Claude hint should point at persistent login only, got %q", hint)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"oauthAccount":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, hint := runtimeAuthState("claude"); !ok || hint != "" {
+		t.Fatalf("normal empty Claude oauthAccount should remain lenient, got ok=%v hint=%q", ok, hint)
+	}
+	if ok, hint := runtimeFileAuthState("claude"); ok || hint == "" {
+		t.Fatalf("strict empty Claude oauthAccount should not count, got ok=%v hint=%q", ok, hint)
+	}
+	credentialsDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialsDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := runtimeFileAuthState("claude"); !ok {
+		t.Fatal("strict Claude auth should accept a valid alternate credentials file")
+	}
+
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, hint := runtimeAuthState("codex"); !ok || hint != "" {
+		t.Fatalf("normal malformed Codex auth should not nag, got ok=%v hint=%q", ok, hint)
+	}
+	if ok, hint := runtimeFileAuthState("codex"); ok || hint == "" {
+		t.Fatalf("strict malformed Codex auth should not count, got ok=%v hint=%q", ok, hint)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"tokens":{"access_token":"   "},"OPENAI_API_KEY":"\t"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, hint := runtimeFileAuthState("codex"); ok || hint == "" {
+		t.Fatalf("strict whitespace-only Codex auth should not count, got ok=%v hint=%q", ok, hint)
+	}
+}
+
+func TestRuntimeAuthHeaderValueIgnoresEnvKeysInsideDockerSandbox(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	customCodexHome := filepath.Join(t.TempDir(), "custom-codex")
+	t.Setenv("CODEX_HOME", customCodexHome)
+	t.Setenv(dockerRuntimeSandboxEnv, "1")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant")
+	t.Setenv("OPENAI_API_KEY", "sk-openai")
+	if err := os.MkdirAll(customCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customCodexHome, "auth.json"), []byte(`{"tokens":{"access_token":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := runtimeAuthHeaderValue(); got != "" {
+		t.Fatalf("runtimeAuthHeaderValue() in sandbox = %q, want env keys and CODEX_HOME ignored", got)
 	}
 }
 
@@ -133,5 +268,56 @@ func TestCheckRuntimeAuthWarnsForInstalledButLoggedOut(t *testing.T) {
 	withRuntimeLookPath(t, lookPathSet())
 	if c := checkRuntimeAuth(); c.Status != "ok" {
 		t.Fatalf("nothing installed: want ok, got %q", c.Status)
+	}
+}
+
+func TestCheckRuntimeAuthUsesFileBackedAuthInsideDockerSandbox(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("COMMENT_IO_AGENT_SANDBOX", "1")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant")
+	withRuntimeLookPath(t, lookPathSet("claude"))
+
+	if c := checkRuntimeAuth(); c.Status != "warn" {
+		t.Fatalf("env-only sandbox Claude auth: want warn, got %q (%s)", c.Status, c.Message)
+	}
+
+	credentialsDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialsDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkRuntimeAuth(); c.Status != "ok" {
+		t.Fatalf("file-backed sandbox Claude auth: want ok, got %q (%s)", c.Status, c.Message)
+	}
+}
+
+func TestCheckRuntimeAuthIgnoresCodexHomeInsideDockerSandbox(t *testing.T) {
+	home := t.TempDir()
+	codexHome := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("COMMENT_IO_AGENT_SANDBOX", "1")
+	t.Setenv("OPENAI_API_KEY", "")
+	withRuntimeLookPath(t, lookPathSet("codex"))
+
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(`{"tokens":{"access_token":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkRuntimeAuth(); c.Status != "warn" {
+		t.Fatalf("sandbox Codex auth in CODEX_HOME: want warn, got %q (%s)", c.Status, c.Message)
+	}
+
+	defaultCodexHome := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(defaultCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultCodexHome, "auth.json"), []byte(`{"tokens":{"access_token":"abc"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkRuntimeAuth(); c.Status != "ok" {
+		t.Fatalf("sandbox Codex auth in default home: want ok, got %q (%s)", c.Status, c.Message)
 	}
 }

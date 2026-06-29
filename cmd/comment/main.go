@@ -332,7 +332,7 @@ func health(home string) error {
 	}
 	store, err := commentbus.OpenExistingStore(ctx, paths)
 	if errors.Is(err, commentbus.ErrStoreNotInitialized) {
-		return printJSON(map[string]any{
+		return printJSON(addDockerAgentHealth(map[string]any{
 			"ok":               true,
 			"version":          version,
 			"protocol_version": commentbus.BusProtocolVersion,
@@ -348,7 +348,7 @@ func health(home string) error {
 				commentbus.FeatureDaemonPairing:   commentbus.FeatureDaemonPairingVersion,
 				commentbus.FeatureAgentEnrollment: commentbus.FeatureAgentEnrollmentVersion,
 			},
-		})
+		}, paths))
 	}
 	if err != nil {
 		return err
@@ -358,7 +358,7 @@ func health(home string) error {
 	if err != nil {
 		return err
 	}
-	return printJSON(map[string]any{
+	return printJSON(addDockerAgentHealth(map[string]any{
 		"ok":               true,
 		"version":          version,
 		"protocol_version": commentbus.BusProtocolVersion,
@@ -374,7 +374,7 @@ func health(home string) error {
 			commentbus.FeatureDaemonPairing:   commentbus.FeatureDaemonPairingVersion,
 			commentbus.FeatureAgentEnrollment: commentbus.FeatureAgentEnrollmentVersion,
 		},
-	})
+	}, paths))
 }
 
 func daemonSocketHealth(home string) error {

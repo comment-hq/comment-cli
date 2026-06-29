@@ -35,6 +35,14 @@ $COMMENT_AGENTS_DIR  ⇄ bind rw        ⇄ /projected-agents  PLAIN-agent profi
                             (no docker.sock · no host network · no other host FS)
 ```
 
+This diagram is the **manual Docker Compose** layout. The canonical website
+installer (`/setup` "Run in a Docker Image", `curl ... | bash -s -- --docker`)
+uses the same sandbox image but only mounts named volumes for `/state`,
+`/home/agent`, and internal projection by default. It does **not** bind-mount
+`/docs`, so synced docs and Botlet brains stay container-private unless you
+intentionally configure a sync root or host projection; use this Compose setup
+when you specifically want host-visible `/docs`.
+
 The agent is **powerful inside the box** (open egress, writable workspace, shell,
 tmux, git); the **host is protected** — no Docker socket, no host network, and
 the only host filesystem it can touch is `/docs` and the plain-agent projection.
@@ -145,6 +153,12 @@ localhost OAuth callback port to publish from the container. The tokens are
 revocable subscription OAuth tokens (no long-lived API key), live in a volume
 **separate from your host's own** `~/.claude`/`~/.codex`, and persist across
 restarts.
+
+Deleting the sandbox volumes is a credential reset. `comment uninstall` for the
+website installer, or manual `docker volume rm` for the named volumes here,
+removes daemon pairing, Comment.io agent/Botlet credentials, and the Claude/Codex
+auth stored under the container's default `/home/agent` homes. Recreate and
+re-pair the sandbox after doing that.
 
 Headless/CI alternative: bake `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` into a
 runtime config the CLI reads from disk (env vars alone won't reach the runtime —

@@ -93,7 +93,7 @@ func TestRenderReadinessBoxReady(t *testing.T) {
 		"Claude logged in",
 		"You're ready",
 		// The ready CTA points at the PAIRED deployment, not hard-coded prod.
-		"https://example.comt.dev/setup",
+		"https://example.comt.dev/setup/handle",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("ready panel missing %q.\n%s", want, out)
@@ -106,7 +106,7 @@ func TestRenderReadinessBoxReady(t *testing.T) {
 	// Unknown base URL falls back to production.
 	var b2 strings.Builder
 	renderReadinessBox(&b2, readinessState{paired: true, daemonRunning: true, authedRuntimes: []string{"codex"}}, false)
-	if !strings.Contains(b2.String(), "https://comment.io/setup") {
+	if !strings.Contains(b2.String(), "https://comment.io/setup/handle") {
 		t.Errorf("ready panel without a base URL must fall back to comment.io.\n%s", b2.String())
 	}
 }
@@ -121,6 +121,85 @@ func TestRenderReadinessBoxDaemonNotRunning(t *testing.T) {
 	}
 	if strings.Contains(out, "You're ready") {
 		t.Errorf("paired-but-stopped panel must not claim readiness.\n%s", out)
+	}
+}
+
+func TestRenderReadinessBoxShowsDockerPersistence(t *testing.T) {
+	var b strings.Builder
+	renderReadinessBox(&b, readinessState{
+		paired:          true,
+		daemonRunning:   true,
+		authedRuntimes:  []string{"claude"},
+		claudeInstalled: true,
+		dockerAgent: &dockerAgentReadiness{
+			State: dockerAgentMountReadiness{
+				Path:       "/state",
+				Mounted:    true,
+				Persistent: true,
+			},
+			Home: dockerAgentMountReadiness{
+				Path:       "/home/agent",
+				Mounted:    true,
+				Persistent: true,
+			},
+			Runtimes: []dockerAgentRuntimeReadiness{
+				{Name: "claude", Installed: true, Authenticated: true},
+				{Name: "codex", Installed: true, Authenticated: false},
+			},
+		},
+	}, false)
+	out := b.String()
+	for _, want := range []string{
+		"Docker storage",
+		"State has a restart-safe mount at /state",
+		"Agent home has a restart-safe mount at /home/agent",
+		"Claude installed & logged in",
+		"Codex installed, not logged in",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Docker readiness panel missing %q.\n%s", want, out)
+		}
+	}
+}
+
+func TestReadinessRequiresDockerPersistence(t *testing.T) {
+	st := readinessState{
+		paired:         true,
+		daemonRunning:  true,
+		authedRuntimes: []string{"claude"},
+		dockerAgent: &dockerAgentReadiness{
+			State:    dockerAgentMountReadiness{Path: "/state", Mounted: false, Persistent: false},
+			Home:     dockerAgentMountReadiness{Path: "/home/agent", Mounted: true, Persistent: true},
+			Runtimes: []dockerAgentRuntimeReadiness{{Name: "claude", Installed: true, Authenticated: true}},
+		},
+	}
+	if st.ready() {
+		t.Fatal("Docker sandbox readiness must require persistent /state and home mounts")
+	}
+	var b strings.Builder
+	renderReadinessBox(&b, st, false)
+	out := b.String()
+	if strings.Contains(out, "You're ready") {
+		t.Fatalf("missing Docker persistence must not claim ready:\n%s", out)
+	}
+	if !strings.Contains(out, "Docker storage mounts are not ready") {
+		t.Fatalf("missing Docker persistence should explain the blocker:\n%s", out)
+	}
+}
+
+func TestDockerReadinessClaudeHintUsesPersistentLogin(t *testing.T) {
+	hints := loginHints(readinessState{
+		claudeInstalled: true,
+		dockerAgent: &dockerAgentReadiness{
+			State: dockerAgentMountReadiness{Path: "/state", Mounted: true, Persistent: true},
+			Home:  dockerAgentMountReadiness{Path: "/home/agent", Mounted: true, Persistent: true},
+		},
+	})
+	if len(hints) == 0 || !strings.Contains(hints[0], "/login") {
+		t.Fatalf("Docker Claude hint = %v, want /login", hints)
+	}
+	if strings.Contains(hints[0], "setup-token") {
+		t.Fatalf("Docker Claude hint must not mention setup-token: %v", hints)
 	}
 }
 

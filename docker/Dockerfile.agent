@@ -38,7 +38,7 @@ COPY --from=build /out/comment /usr/local/bin/comment
 COPY docker/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 COPY docker/project-agents.js /usr/local/bin/project-agents.js
 COPY docker/seed-runtime-config.cjs /usr/local/bin/seed-runtime-config.cjs
-RUN chmod +x /usr/local/bin/agent-entrypoint.sh /usr/local/bin/project-agents.js /usr/local/bin/seed-runtime-config.cjs
+RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh /usr/local/bin/project-agents.js /usr/local/bin/seed-runtime-config.cjs
 
 # Non-root agent user with a writable home (creds + workspace persist via a
 # mounted volume at /home/agent). Pre-create /state + /projected-agents owned by

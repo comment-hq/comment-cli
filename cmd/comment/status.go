@@ -21,7 +21,7 @@ import (
 type readinessState struct {
 	paired          bool
 	pairedLabel     string
-	daemonRunning   bool // the bus daemon answers on its socket (it actually services work)
+	daemonRunning   bool     // the bus daemon answers on its socket (it actually services work)
 	authedRuntimes  []string // subset of {claude, codex}: installed AND logged in, sorted
 	claudeInstalled bool
 	codexInstalled  bool
@@ -35,6 +35,7 @@ type readinessState struct {
 	// ready, so the panel never says "ready" about a different runtime than the
 	// one about to launch. Empty = the global "any coding agent" view.
 	focusRuntime string
+	dockerAgent  *dockerAgentReadiness
 }
 
 func (s readinessState) loggedIn() bool {
@@ -49,11 +50,17 @@ func (s readinessState) loggedIn() bool {
 	return len(s.authedRuntimes) > 0
 }
 
+func (s readinessState) dockerPersistent() bool {
+	return s.dockerAgent == nil || (s.dockerAgent.State.Persistent && s.dockerAgent.Home.Persistent)
+}
+
 // ready requires the daemon to actually be RUNNING, not just paired: a
 // paired-but-stopped daemon (stale auth file, or `bus install` that failed and
 // fell through) would otherwise read as ready while no worker installs agents or
 // services work.
-func (s readinessState) ready() bool { return s.paired && s.daemonRunning && s.loggedIn() }
+func (s readinessState) ready() bool {
+	return s.paired && s.daemonRunning && s.loggedIn() && s.dockerPersistent()
+}
 
 // gatherReadiness collects pairing + runtime-login state. Both signals reuse the
 // exact helpers `comment doctor` uses (LoadDaemonAuth + runtimeAuthState), so
@@ -88,6 +95,23 @@ func gatherReadiness(paths commentbus.Paths) readinessState {
 			continue
 		}
 		st.authedRuntimes = append(st.authedRuntimes, runtime)
+	}
+	st.dockerAgent = dockerAgentReadinessIfSandbox(paths)
+	if st.dockerAgent != nil {
+		st.authedRuntimes = nil
+		st.claudeInstalled = false
+		st.codexInstalled = false
+		for _, runtime := range st.dockerAgent.Runtimes {
+			switch runtime.Name {
+			case "claude":
+				st.claudeInstalled = runtime.Installed
+			case "codex":
+				st.codexInstalled = runtime.Installed
+			}
+			if runtime.Installed && runtime.Authenticated {
+				st.authedRuntimes = append(st.authedRuntimes, runtime.Name)
+			}
+		}
 	}
 	return st
 }
@@ -231,13 +255,20 @@ func renderReadinessBox(w io.Writer, st readinessState, color bool) {
 		}
 	}
 
+	if st.dockerAgent != nil {
+		fmt.Fprintln(w, bar(color))
+		renderDockerAgentReadiness(w, *st.dockerAgent, color)
+	}
+
 	fmt.Fprintln(w, bar(color))
 	if st.ready() {
 		setupURL := strings.TrimRight(st.setupBaseURL, "/")
 		if setupURL == "" {
 			setupURL = "https://comment.io"
 		}
-		fmt.Fprintf(w, "%s   %s\n", bar(color), paint(color, "You're ready! Create agents at "+setupURL+"/setup", ansiBold, ansiBrightGreen))
+		fmt.Fprintf(w, "%s   %s\n", bar(color), paint(color, "You're ready! Create agents at "+setupURL+"/setup/handle", ansiBold, ansiBrightGreen))
+	} else if !st.dockerPersistent() {
+		fmt.Fprintf(w, "%s   %s\n", bar(color), paint(color, "Almost there — Docker storage mounts are not ready.", ansiBold, ansiYellow))
 	} else if !st.loggedIn() {
 		fmt.Fprintf(w, "%s   %s\n", bar(color), paint(color, "Not ready yet — finish the glowing step above.", ansiBold, ansiYellow))
 	} else {
@@ -245,6 +276,55 @@ func renderReadinessBox(w io.Writer, st readinessState, color bool) {
 	}
 	bottomRule(w, color)
 	fmt.Fprintln(w)
+}
+
+func renderDockerAgentReadiness(w io.Writer, readiness dockerAgentReadiness, color bool) {
+	fmt.Fprintf(w, "%s   %s\n", bar(color), paint(color, "Docker storage", ansiBold))
+	renderDockerAgentMount(w, "State", readiness.State, color)
+	renderDockerAgentMount(w, "Agent home", readiness.Home, color)
+	for _, runtime := range readiness.Runtimes {
+		marker := pendingMark(color)
+		status := dockerAgentRuntimeLabel(runtime.Name) + " missing or logged out"
+		switch {
+		case runtime.Installed && runtime.Authenticated:
+			marker = doneMark(color)
+			status = dockerAgentRuntimeLabel(runtime.Name) + " installed & logged in"
+		case runtime.Installed:
+			status = dockerAgentRuntimeLabel(runtime.Name) + " installed, not logged in"
+		case runtime.Authenticated:
+			status = dockerAgentRuntimeLabel(runtime.Name) + " auth found, binary missing"
+		}
+		fmt.Fprintf(w, "%s   %s  %s\n", bar(color), marker, status)
+	}
+}
+
+func renderDockerAgentMount(w io.Writer, label string, mount dockerAgentMountReadiness, color bool) {
+	marker := pendingMark(color)
+	status := label + " is not mounted"
+	if mount.Persistent {
+		marker = doneMark(color)
+		status = fmt.Sprintf("%s has a restart-safe mount at %s", label, mount.Path)
+	} else if mount.Mounted {
+		detail := mount.FSType
+		if detail == "" {
+			detail = "unknown filesystem"
+		}
+		status = fmt.Sprintf("%s mounted at %s but not persistent (%s)", label, mount.Path, detail)
+	} else if mount.Path != "" {
+		status = fmt.Sprintf("%s is not mounted at %s", label, mount.Path)
+	}
+	fmt.Fprintf(w, "%s   %s  %s\n", bar(color), marker, status)
+}
+
+func dockerAgentRuntimeLabel(runtime string) string {
+	switch runtime {
+	case "claude":
+		return "Claude"
+	case "codex":
+		return "Codex"
+	default:
+		return runtime
+	}
 }
 
 func bar(color bool) string { return paint(color, "  │", ansiCyan) }
@@ -286,6 +366,9 @@ func loggedInSummary(st readinessState) string {
 // to a focus runtime (comment run --runtime X), only that runtime's hint shows.
 func loginHints(st readinessState) []string {
 	claude := "run:  claude        (or  claude setup-token)"
+	if st.dockerAgent != nil {
+		claude = "run:  claude        (then  /login)"
+	}
 	if !st.claudeInstalled {
 		claude = "install Claude Code, then run:  claude"
 	}

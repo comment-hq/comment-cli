@@ -142,13 +142,17 @@ func checkRuntimeOnPATH() doctorCheck {
 // a user with only one CLI isn't nagged about the other.
 func checkRuntimeAuth() doctorCheck {
 	var problems []string
+	authState := runtimeAuthState
+	if runningInsideDockerAgentSandbox() {
+		authState = runtimeFileAuthState
+	}
 	if _, err := runtimeLookPath("claude"); err == nil {
-		if ok, hint := runtimeAuthState("claude"); !ok {
+		if ok, hint := authState("claude"); !ok {
 			problems = append(problems, hint)
 		}
 	}
 	if _, err := runtimeLookPath("codex"); err == nil {
-		if ok, hint := runtimeAuthState("codex"); !ok {
+		if ok, hint := authState("codex"); !ok {
 			problems = append(problems, hint)
 		}
 	}
