@@ -1871,7 +1871,7 @@ func TestDaemonBmuxRecoverDeadRuntimeRelaunchesWithClaudeResumeAndNudges(t *test
 	if recoverErr != nil || !ok || hadStale || len(released) != 0 {
 		t.Fatalf("reconcile = record:%+v ok:%v hadStale:%v released:%+v err:%+v", recovered, ok, hadStale, released, recoverErr)
 	}
-	wantCommand := []string{"claude", "--resume", oldRef, "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--resume", oldRef, "--dangerously-skip-permissions"}
 	if recovered.RuntimeSessionRef != oldRef || fmt.Sprint(recovered.RuntimeCommand) != fmt.Sprint(wantCommand) {
 		t.Fatalf("recovered runtime = ref:%q command:%#v, want ref %q command %#v", recovered.RuntimeSessionRef, recovered.RuntimeCommand, oldRef, wantCommand)
 	}
@@ -1914,7 +1914,7 @@ func TestDaemonBmuxRecoverDeadSocketKillsOrphanAndRelaunches(t *testing.T) {
 	if recovered.State != "alive" {
 		t.Fatalf("recovered state = %q, want alive", recovered.State)
 	}
-	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
 	if fmt.Sprint(recovered.RuntimeCommand) != fmt.Sprint(wantCommand) {
 		t.Fatalf("runtime command = %#v, want %#v", recovered.RuntimeCommand, wantCommand)
 	}
@@ -1943,7 +1943,7 @@ func TestDaemonBmuxRecoverDeadSocketNoOrphanResumesInPlace(t *testing.T) {
 	if recovered.SessionID != record.SessionID || recovered.Generation != record.Generation {
 		t.Fatalf("recovered identity = %s/%s, want %s/%s", recovered.SessionID, recovered.Generation, record.SessionID, record.Generation)
 	}
-	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
 	if fmt.Sprint(recovered.RuntimeCommand) != fmt.Sprint(wantCommand) {
 		t.Fatalf("runtime command = %#v, want %#v", recovered.RuntimeCommand, wantCommand)
 	}

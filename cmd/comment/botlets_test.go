@@ -1865,8 +1865,15 @@ func TestResolveBotletsRunShortcutAcceptsAliasAndCanonicalizesRuntimeArgs(t *tes
 		t.Fatalf("entry = %+v", entry)
 	}
 	args := botletsShortcutRuntimeArgs(entry.ManagedSession.Runtime, entry.Name)
-	if !slices.Contains(args, "research-reader") {
-		t.Fatalf("runtime args = %+v, want canonical bot name", args)
+	// Issue #1420: claude botlet runtime must NOT pass `--agent <bot>` — Claude
+	// Code >= 2.1.x hard-errors on the unknown flag. Identity comes from the brain
+	// working dir + env injection, so neither `--agent` nor the bot name appears on
+	// the command line.
+	if slices.Contains(args, "--agent") || slices.Contains(args, "research-reader") {
+		t.Fatalf("runtime args = %+v, want no --agent/bot name for claude", args)
+	}
+	if !slices.Contains(args, "--dangerously-skip-permissions") {
+		t.Fatalf("runtime args = %+v, want --dangerously-skip-permissions", args)
 	}
 }
 

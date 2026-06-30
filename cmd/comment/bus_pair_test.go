@@ -108,6 +108,12 @@ func TestBusPairHappyPathWritesDaemonAuth(t *testing.T) {
 	if !strings.Contains(output, "ABCDEFGH") {
 		t.Fatalf("output missing user code:\n%s", output)
 	}
+	if !strings.Contains(output, "If the page asks for a code, enter: ABCDEFGH") {
+		t.Fatalf("output should present the user code as fallback-only copy:\n%s", output)
+	}
+	if strings.Contains(output, "Code:  ABCDEFGH") {
+		t.Fatalf("output should not present the user code as a second normal required step:\n%s", output)
+	}
 	if strings.Contains(output, "ldt_ag_owner_ld_x_test-secret-token") {
 		t.Fatalf("output leaked the daemon token:\n%s", output)
 	}
@@ -144,6 +150,101 @@ func TestBusPairHappyPathWritesDaemonAuth(t *testing.T) {
 	}
 	if len(auth.Capabilities) != 1 || auth.Capabilities[0] != "agent_enrollment:v1" {
 		t.Fatalf("saved capabilities = %#v", auth.Capabilities)
+	}
+}
+
+func TestBusPairCLIModePrintsApprovalAndResumeCompletes(t *testing.T) {
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var starts int32
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&starts, 1)
+		busPairStartHandler(t, func() string { return server.URL }, 1, 600)(w, r)
+	})
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&redeems, 1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("redeem body unreadable: %v", err)
+		}
+		if body["device_code"] != testBusPairDeviceCode {
+			t.Errorf("resume redeem device_code = %#v", body["device_code"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"daemon_token": "ldt_ag_owner_ld_x_cli-secret-token",
+			"daemon_id":    "ld_cli",
+			"owner_handle": "max",
+			"label":        "CLI Mac",
+			"capabilities": []string{"agent_enrollment:v1"},
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var startOut bytes.Buffer
+	if err := busPairCLI(&startOut, home, "CLI Mac", server.URL, false); err != nil {
+		t.Fatalf("busPairCLI err = %v\noutput:\n%s", err, startOut.String())
+	}
+	if got := atomic.LoadInt32(&starts); got != 1 {
+		t.Fatalf("start calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&redeems); got != 0 {
+		t.Fatalf("CLI mode must not poll before resume; redeem calls = %d", got)
+	}
+	output := startOut.String()
+	for _, want := range []string{
+		"Approval URL: " + server.URL + "/setup/daemon?code=ABCDEFGH",
+		"Code: ABCDEFGH",
+		"comment bus pair --resume --home ",
+		"send the Approval URL and Code to the human",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("CLI output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, testBusPairDeviceCode) || strings.Contains(output, "ldt_ag_owner_ld_x_cli-secret-token") {
+		t.Fatalf("CLI output leaked a secret:\n%s", output)
+	}
+
+	paths, err := commentbus.ResolvePaths(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := busPairPendingPath(paths)
+	info, err := os.Stat(pendingPath)
+	if err != nil {
+		t.Fatalf("pending pairing file missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("pending pairing mode = %v, want 0600", info.Mode().Perm())
+	}
+	if _, err := os.Stat(commentbus.DaemonAuthPath(paths)); !os.IsNotExist(err) {
+		t.Fatalf("daemon-auth.json should not exist before resume, stat err = %v", err)
+	}
+
+	var resumeOut bytes.Buffer
+	if err := busPairResume(&resumeOut, home); err != nil {
+		t.Fatalf("busPairResume err = %v\noutput:\n%s", err, resumeOut.String())
+	}
+	if got := atomic.LoadInt32(&redeems); got != 1 {
+		t.Fatalf("resume redeem calls = %d, want 1", got)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending pairing file should be deleted after resume, stat err = %v", err)
+	}
+	auth, ok, err := commentbus.LoadDaemonAuth(paths)
+	if err != nil || !ok {
+		t.Fatalf("LoadDaemonAuth after resume = ok %v err %v", ok, err)
+	}
+	if auth.Token != "ldt_ag_owner_ld_x_cli-secret-token" || auth.DaemonID != "ld_cli" {
+		t.Fatalf("saved auth after resume = %+v", auth)
+	}
+	if !strings.Contains(resumeOut.String(), "Paired this computer as \"CLI Mac\"") {
+		t.Fatalf("resume output missing success:\n%s", resumeOut.String())
 	}
 }
 
@@ -321,6 +422,92 @@ func TestBusPairAlreadyRedeemedCodeFails(t *testing.T) {
 	}
 }
 
+func TestBusPairOwnerProfileMissingFailsWithReauthGuidance(t *testing.T) {
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 1, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":     "We could not verify your Comment.io account for pairing. Sign out and back in, then run pairing again. If this keeps happening, contact us.",
+			"code":      "PAIR_OWNER_PROFILE_MISSING",
+			"retryable": false,
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	err := busPair(&out, home, "Test Mac", server.URL, false)
+	if err == nil || !strings.Contains(err.Error(), "could not verify your Comment.io account") {
+		t.Fatalf("owner-profile-missing pair err = %v, want soft verification guidance", err)
+	}
+	if !strings.Contains(err.Error(), "contact us") {
+		t.Fatalf("owner-profile-missing pair err = %v, want contact-us guidance", err)
+	}
+	if !strings.Contains(err.Error(), "comment bus pair") {
+		t.Fatalf("owner-profile-missing pair err = %v, want explicit comment bus pair rerun guidance", err)
+	}
+	if strings.Contains(err.Error(), "already redeemed") || strings.Contains(err.Error(), "Paired computers") {
+		t.Fatalf("owner-profile-missing pair err used orphaned-pairing wording: %v", err)
+	}
+	paths, pathsErr := commentbus.ResolvePaths(home)
+	if pathsErr != nil {
+		t.Fatal(pathsErr)
+	}
+	if _, statErr := os.Stat(commentbus.DaemonAuthPath(paths)); !os.IsNotExist(statErr) {
+		t.Fatalf("daemon-auth.json should not exist after owner-profile-missing failure, stat err = %v", statErr)
+	}
+}
+
+func TestBusPairRetriesRetryableServerUnavailable(t *testing.T) {
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 1, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&redeems, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":     "Could not verify your Comment.io account for pairing; retry shortly",
+				"code":      "PAIR_OWNER_PROFILE_UNAVAILABLE",
+				"retryable": true,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"daemon_token": "ldt_ag_owner_ld_x_retryable-503-token",
+			"daemon_id":    "ld_retryable_503",
+			"owner_handle": "max",
+			"label":        "Retryable 503 Mac",
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	if err := busPair(&out, home, "Retryable 503 Mac", server.URL, false); err != nil {
+		t.Fatalf("busPair must survive retryable server unavailable: %v", err)
+	}
+	if got := atomic.LoadInt32(&redeems); got != 2 {
+		t.Fatalf("redeem calls = %d, want 2 (one retryable 503, one success)", got)
+	}
+	paths, err := commentbus.ResolvePaths(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, ok, err := commentbus.LoadDaemonAuth(paths)
+	if err != nil || !ok || auth.DaemonID != "ld_retryable_503" {
+		t.Fatalf("LoadDaemonAuth after retryable 503 = ok %v err %v auth %+v", ok, err, auth)
+	}
+}
+
 func TestBusPairPollRedeemRetriesTransportFailure(t *testing.T) {
 	// A network-level redeem failure is AMBIGUOUS: the request may have reached
 	// the Worker and committed the pairing even though the response was lost.
@@ -415,6 +602,202 @@ func TestBusPairEmitsHeartbeatWhileWaiting(t *testing.T) {
 	}
 	if !strings.Contains(got, "ABCDEFGH") {
 		t.Fatalf("heartbeat should re-show the pairing code; got:\n%s", got)
+	}
+	if !strings.Contains(got, "If the page asks for a code, enter ABCDEFGH") {
+		t.Fatalf("heartbeat should present the pairing code as fallback-only copy; got:\n%s", got)
+	}
+	if strings.Contains(got, "confirm code ABCDEFGH") || strings.Contains(got, "enter code ABCDEFGH") {
+		t.Fatalf("heartbeat should not present the code as part of the normal complete URL flow; got:\n%s", got)
+	}
+}
+
+func TestBusPairReportsRetryableServerFailureAfterApproval(t *testing.T) {
+	// A retryable 503 from redeem means the browser already approved the code,
+	// but the server could not finish registering the daemon yet. Surface that
+	// state distinctly so a real registration failure does not look like the user
+	// forgot to approve the browser prompt.
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 1, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&redeems, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":     "Daemon registration failed; retry shortly",
+				"code":      "PAIR_REGISTER_FAILED",
+				"retryable": true,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"daemon_token": "ldt_ag_owner_ld_x_503-secret-token",
+			"daemon_id":    "ld_503",
+			"owner_handle": "max",
+			"label":        "Retry Server Mac",
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	if err := busPair(&out, home, "Retry Server Mac", server.URL, false); err != nil {
+		t.Fatalf("busPair should retry a transient server failure: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Pairing was approved") || !strings.Contains(got, "PAIR_REGISTER_FAILED") {
+		t.Fatalf("retryable server failure should be visible as approved-but-registering; got:\n%s", got)
+	}
+	if strings.Contains(got, "ldt_ag_owner_ld_x_503-secret-token") {
+		t.Fatalf("output leaked the daemon token:\n%s", got)
+	}
+}
+
+func TestBusPairKeepsApprovedExpiryErrorAfterRetryableServerFailure(t *testing.T) {
+	// If the server reports expiry after we already saw an approved retryable
+	// registration failure, keep the recovery message in the approved/registering
+	// state instead of reverting to "expired before approval".
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 1, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&redeems, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":     "Daemon registration failed; retry shortly",
+				"code":      "PAIR_REGISTER_FAILED",
+				"retryable": true,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusGone)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": "pair_code_expired",
+			"code":  "PAIR_CODE_EXPIRED",
+		})
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	err := busPair(&out, home, "Retry Expiry Mac", server.URL, false)
+	if err == nil {
+		t.Fatal("busPair should fail after the server expires the approved retry")
+	}
+	if !strings.Contains(err.Error(), "pairing was approved") || !strings.Contains(err.Error(), "PAIR_REGISTER_FAILED") {
+		t.Fatalf("err = %v, want approved retry expiry guidance", err)
+	}
+	if strings.Contains(err.Error(), "expired before it was approved") {
+		t.Fatalf("err = %v, should not revert to pre-approval expiry guidance", err)
+	}
+}
+
+func TestBusPairDoesNotTreatGeneric503AsApproved(t *testing.T) {
+	// A plain 503 can come from the edge before the user has approved anything.
+	// It should be retried without changing the user-facing state to
+	// approved-but-registering.
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 30, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.AddInt32(&redeems, 1) {
+		case 1:
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":    "authorization_pending",
+				"code":     "AUTHORIZATION_PENDING",
+				"interval": 30,
+			})
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"daemon_token": "ldt_ag_owner_ld_x_generic-503-secret-token",
+				"daemon_id":    "ld_generic_503",
+				"owner_handle": "max",
+				"label":        "Generic 503 Mac",
+			})
+		}
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	if err := busPair(&out, home, "Generic 503 Mac", server.URL, false); err != nil {
+		t.Fatalf("busPair should retry a generic 503: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "Pairing was approved") {
+		t.Fatalf("generic 503 should not switch to approved/registering guidance:\n%s", got)
+	}
+	if !strings.Contains(got, "still waiting for you to approve") {
+		t.Fatalf("generic 503 should keep the pre-approval waiting guidance:\n%s", got)
+	}
+}
+
+func TestBusPairKeepsApprovedStatusAcrossRedeemingPolls(t *testing.T) {
+	// The pairing DO can answer authorization_pending while an approved redeem
+	// claim is still in flight. Once the CLI has seen a retryable post-approval
+	// server problem, later transient pending responses must not revert the
+	// user-facing state back to "you still need to approve this".
+	home := testBusPairHome(t)
+	stubBusPairSleep(t)
+	var redeems int32
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/daemon/pair/start", busPairStartHandler(t, func() string { return server.URL }, 30, 600))
+	mux.HandleFunc("/daemon/pair/redeem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch atomic.AddInt32(&redeems, 1) {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":     "Daemon registration failed; retry shortly",
+				"code":      "PAIR_REGISTER_FAILED",
+				"retryable": true,
+			})
+		case 2, 3:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":    "authorization_pending",
+				"code":     "AUTHORIZATION_PENDING",
+				"interval": 30,
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"daemon_token": "ldt_ag_owner_ld_x_redeeming-secret-token",
+				"daemon_id":    "ld_redeeming",
+				"owner_handle": "max",
+				"label":        "Redeeming Mac",
+			})
+		}
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	var out bytes.Buffer
+	if err := busPair(&out, home, "Redeeming Mac", server.URL, false); err != nil {
+		t.Fatalf("busPair should keep polling through redeeming state: %v", err)
+	}
+	got := out.String()
+	approvedAt := strings.Index(got, "Pairing was approved")
+	if approvedAt < 0 {
+		t.Fatalf("output never entered approved retry state:\n%s", got)
+	}
+	if strings.Contains(got[approvedAt:], "still waiting for you to approve") {
+		t.Fatalf("output reverted to pre-approval guidance after approved retry state:\n%s", got)
 	}
 }
 

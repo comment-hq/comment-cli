@@ -32,7 +32,7 @@ func TestRegisterSessionWritesRecordAndCapability(t *testing.T) {
 	if !LocalSessionIDRE.MatchString(record.SessionID) || !LocalSessionGenerationIDRE.MatchString(record.Generation) {
 		t.Fatalf("invalid generated ids: %+v", record)
 	}
-	if record.Runtime != "claude" || len(record.RuntimeCommand) != 4 || record.RuntimeCommand[0] != "claude" || record.RuntimeCommand[2] != "reviewer" || record.RuntimeCommand[3] != "--dangerously-skip-permissions" {
+	if record.Runtime != "claude" || len(record.RuntimeCommand) != 2 || record.RuntimeCommand[0] != "claude" || record.RuntimeCommand[1] != "--dangerously-skip-permissions" {
 		t.Fatalf("unexpected runtime command: %+v", record.RuntimeCommand)
 	}
 	if token, err := ReadCapability(record.CapabilityFile); err != nil || !CapabilityTokenRE.MatchString(token) {
@@ -250,7 +250,7 @@ func TestRegisterSessionBmuxClaudePinsRuntimeSessionRefAndOutputLog(t *testing.T
 	if !UUIDRE.MatchString(record.RuntimeSessionRef) {
 		t.Fatalf("runtime session ref = %q, want UUID", record.RuntimeSessionRef)
 	}
-	wantCommand := []string{"claude", "--session-id", record.RuntimeSessionRef, "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--session-id", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
 	if fmt.Sprint(record.RuntimeCommand) != fmt.Sprint(wantCommand) {
 		t.Fatalf("runtime command = %#v, want %#v", record.RuntimeCommand, wantCommand)
 	}
@@ -285,7 +285,7 @@ func TestRegisterSessionBmuxClaudeResumeUsesRuntimeSessionRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--resume", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
 	if fmt.Sprint(record.RuntimeCommand) != fmt.Sprint(wantCommand) {
 		t.Fatalf("runtime command = %#v, want %#v", record.RuntimeCommand, wantCommand)
 	}

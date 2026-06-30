@@ -85,7 +85,7 @@ func TestMintEphemeralViaPairing_HappyPath(t *testing.T) {
 		t.Fatalf("result base_url = %v, want %v", result["base_url"], backend.URL)
 	}
 	credPath, _ := result["cred_file"].(string)
-	if credPath != filepath.Join(d.paths.Home, "ethereal", "owner.e-deadbeef.json") {
+	if credPath != filepath.Join(d.paths.Home, "ephemeral", "owner.e-deadbeef.json") {
 		t.Fatalf("result cred_file = %v", credPath)
 	}
 
@@ -117,8 +117,30 @@ func TestMintEphemeralViaPairing_HappyPath(t *testing.T) {
 	if cred.Handle != "owner.e-deadbeef" {
 		t.Fatalf("cred handle = %q", cred.Handle)
 	}
-	if cred.IdentityClass != "ethereal" {
-		t.Fatalf("cred identity_class = %q, want ethereal", cred.IdentityClass)
+	if cred.IdentityClass != "ephemeral" {
+		t.Fatalf("cred identity_class = %q, want ephemeral", cred.IdentityClass)
+	}
+	legacyPath := filepath.Join(d.paths.Home, "ethereal", "owner.e-deadbeef.json")
+	legacyInfo, err := os.Stat(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("legacy cred file mode = %v, want 0600", legacyInfo.Mode().Perm())
+	}
+	var legacyCred daemonEphemeralCred
+	legacyData, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(legacyData, &legacyCred); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCred.AgentSecret != "as_ag_abc123_secret" {
+		t.Fatalf("legacy cred secret = %q", legacyCred.AgentSecret)
+	}
+	if legacyCred.IdentityClass != "ethereal" {
+		t.Fatalf("legacy cred identity_class = %q, want ethereal", legacyCred.IdentityClass)
 	}
 }
 
@@ -170,7 +192,7 @@ func TestMintEphemeralOverSocketNoAuth(t *testing.T) {
 		t.Fatalf("socket response leaked a secret-shaped value: %s", enc)
 	}
 	// The daemon persisted the secret-bearing cred file at 0600.
-	credPath := filepath.Join(paths.Home, "ethereal", "owner.e-deadbeef.json")
+	credPath := filepath.Join(paths.Home, "ephemeral", "owner.e-deadbeef.json")
 	info, err := os.Stat(credPath)
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("cred file stat = %v / err %v", info, err)
@@ -189,9 +211,9 @@ func TestMintEphemeralViaPairing_StoreCheckedBeforeMint(t *testing.T) {
 	defer backend.Close()
 
 	d := pairTestDaemon(t, backend.URL)
-	// Make the ethereal store impossible to create: a regular file sits where the
+	// Make the ephemeral store impossible to create: a regular file sits where the
 	// directory should go, so MkdirAll fails. The mint must NOT be consumed.
-	if err := os.WriteFile(filepath.Join(d.paths.Home, "ethereal"), []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(d.paths.Home, "ephemeral"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, sockErr := d.mintEphemeralViaPairing(context.Background(), SocketRequest{
@@ -202,6 +224,32 @@ func TestMintEphemeralViaPairing_StoreCheckedBeforeMint(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("backend called %d times; the store must be validated BEFORE minting", calls)
+	}
+}
+
+func TestMintEphemeralViaPairing_LegacyStoreCheckedBeforeMint(t *testing.T) {
+	var calls int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"handle": "owner.e-deadbeef", "agent_secret": "as_x_y", "expires_at": "2026-07-22T00:00:00.000Z",
+		})
+	}))
+	defer backend.Close()
+
+	d := pairTestDaemon(t, backend.URL)
+	if err := os.WriteFile(filepath.Join(d.paths.Home, "ethereal"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, sockErr := d.mintEphemeralViaPairing(context.Background(), SocketRequest{
+		Params: map[string]any{"session": "sess-abc"},
+	})
+	if sockErr == nil || sockErr.Code != "INTERNAL_ERROR" {
+		t.Fatalf("err = %+v, want INTERNAL_ERROR", sockErr)
+	}
+	if calls != 0 {
+		t.Fatalf("backend called %d times; the legacy store must be validated BEFORE minting", calls)
 	}
 }
 
@@ -262,7 +310,7 @@ func TestMintEphemeralViaPairing_MalformedMint(t *testing.T) {
 	if sockErr == nil || sockErr.Code != "UPSTREAM_ERROR" {
 		t.Fatalf("err = %+v, want UPSTREAM_ERROR", sockErr)
 	}
-	if _, err := os.Stat(filepath.Join(d.paths.Home, "ethereal", "owner.e-deadbeef.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(d.paths.Home, "ephemeral", "owner.e-deadbeef.json")); !os.IsNotExist(err) {
 		t.Fatal("a malformed mint must not persist a cred file")
 	}
 }

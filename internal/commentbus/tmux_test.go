@@ -602,7 +602,7 @@ func TestRunSessionExecUsesAllowlistedRuntimeAndEnv(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("RunSessionExec error = %v", err)
 	}
-	if execPath != resolvedClaudePath || len(execArgv) != 4 || execArgv[1] != "--agent" || execArgv[2] != "reviewer" || execArgv[3] != "--dangerously-skip-permissions" {
+	if execPath != resolvedClaudePath || len(execArgv) != 2 || execArgv[1] != "--dangerously-skip-permissions" {
 		t.Fatalf("exec path/argv = %q %#v", execPath, execArgv)
 	}
 	env := strings.Join(execEnv, "\n")
@@ -654,7 +654,7 @@ func TestRunSessionExecUsesAllowlistedRuntimeAndEnv(t *testing.T) {
 	if lookPathCalled {
 		t.Fatal("absolute runtime command unexpectedly used PATH lookup")
 	}
-	if execPath != resolvedClaudePath || len(execArgv) != 4 || execArgv[1] != "--agent" || execArgv[2] != "reviewer" || execArgv[3] != "--dangerously-skip-permissions" {
+	if execPath != resolvedClaudePath || len(execArgv) != 2 || execArgv[1] != "--dangerously-skip-permissions" {
 		t.Fatalf("absolute runtime exec path/argv = %q %#v", execPath, execArgv)
 	}
 	env = strings.Join(execEnv, "\n")

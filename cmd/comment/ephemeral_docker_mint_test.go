@@ -35,19 +35,19 @@ func stubContainerMint(t *testing.T, out string, gotContainer, gotBase, gotSess 
 // comment-agent-<slug> container for the origin.
 func TestEphemeralDockerExecMintPersistsToHostStore(t *testing.T) {
 	dir := t.TempDir()
-	etherealDir := filepath.Join(dir, "ethereal")
+	ephemeralDir := filepath.Join(dir, "ephemeral")
 	bindFile := filepath.Join(dir, "rewake", "bind-sess1")
-	if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+	if err := os.MkdirAll(ephemeralDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(bindFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var gotContainer, gotBase string
-	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_t_secret","identity_class":"ethereal","actor_id":"ai:max.e-abcd1234","base_url":"https://comt.dev","expires_at":"2999-01-01T00:00:00.000Z"}`, &gotContainer, &gotBase, nil)
+	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_t_secret","identity_class":"ephemeral","actor_id":"ai:max.e-abcd1234","base_url":"https://comt.dev","expires_at":"2999-01-01T00:00:00.000Z"}`, &gotContainer, &gotBase, nil)
 
 	base := "https://comt.dev"
-	cred, credPath, ok := ephemeralTryDockerExecMint("sess1", "Pat (Pairing)", base, etherealDir, bindFile)
+	cred, credPath, ok := ephemeralTryDockerExecMint("sess1", "Pat (Pairing)", base, ephemeralDir, bindFile)
 	if !ok {
 		t.Fatalf("ephemeralTryDockerExecMint ok = false, want true")
 	}
@@ -58,8 +58,8 @@ func TestEphemeralDockerExecMintPersistsToHostStore(t *testing.T) {
 	if cred.BaseURL != "https://comt.dev" || cred.Session != "sess1" {
 		t.Fatalf("cred base/session = (%q,%q), want (https://comt.dev,sess1)", cred.BaseURL, cred.Session)
 	}
-	if cred.IdentityClass != "ethereal" {
-		t.Fatalf("cred identity_class = %q, want ethereal", cred.IdentityClass)
+	if cred.IdentityClass != "ephemeral" {
+		t.Fatalf("cred identity_class = %q, want ephemeral", cred.IdentityClass)
 	}
 	if cred.ExpiresAt != "2999-01-01T00:00:00.000Z" {
 		t.Fatalf("cred expires_at = %q, want the container's value", cred.ExpiresAt)
@@ -72,7 +72,7 @@ func TestEphemeralDockerExecMintPersistsToHostStore(t *testing.T) {
 		t.Fatalf("in-container --base-url = %q, want %q", gotBase, base)
 	}
 	// Persisted to the HOST store + bind pointer.
-	if credPath != filepath.Join(etherealDir, "max.e-abcd1234.json") {
+	if credPath != filepath.Join(ephemeralDir, "max.e-abcd1234.json") {
 		t.Fatalf("credPath = %q", credPath)
 	}
 	if _, err := os.Stat(credPath); err != nil {
@@ -87,10 +87,10 @@ func TestEphemeralDockerExecMintPersistsToHostStore(t *testing.T) {
 // up front — never hand this session a credential for the wrong deployment.
 func TestEphemeralDockerExecMintRejectsBaseMismatch(t *testing.T) {
 	dir := t.TempDir()
-	etherealDir := filepath.Join(dir, "ethereal")
-	_ = os.MkdirAll(etherealDir, 0o700)
-	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_x","identity_class":"ethereal","base_url":"https://comment.io"}`, nil, nil, nil)
-	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", etherealDir, filepath.Join(dir, "bind")); ok {
+	ephemeralDir := filepath.Join(dir, "ephemeral")
+	_ = os.MkdirAll(ephemeralDir, 0o700)
+	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_x","identity_class":"ephemeral","base_url":"https://comment.io"}`, nil, nil, nil)
+	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", ephemeralDir, filepath.Join(dir, "bind")); ok {
 		t.Fatalf("ok = true, want false when the container minted against a different origin")
 	}
 }
@@ -98,35 +98,35 @@ func TestEphemeralDockerExecMintRejectsBaseMismatch(t *testing.T) {
 // A malformed container response is rejected (caller falls back to anonymous).
 func TestEphemeralDockerExecMintRejectsMalformed(t *testing.T) {
 	dir := t.TempDir()
-	etherealDir := filepath.Join(dir, "ethereal")
-	_ = os.MkdirAll(etherealDir, 0o700)
+	ephemeralDir := filepath.Join(dir, "ephemeral")
+	_ = os.MkdirAll(ephemeralDir, 0o700)
 	stubContainerMint(t, `{"handle":"../escape","agent_secret":"nope"}`, nil, nil, nil)
-	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", etherealDir, filepath.Join(dir, "bind")); ok {
+	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", ephemeralDir, filepath.Join(dir, "bind")); ok {
 		t.Fatalf("ok = true, want false for a malformed handle/secret")
 	}
 }
 
 func TestEphemeralDockerExecMintAcceptsLegacyUnmarkedOutput(t *testing.T) {
 	dir := t.TempDir()
-	etherealDir := filepath.Join(dir, "ethereal")
-	_ = os.MkdirAll(etherealDir, 0o700)
+	ephemeralDir := filepath.Join(dir, "ephemeral")
+	_ = os.MkdirAll(ephemeralDir, 0o700)
 	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_x","base_url":"https://comt.dev"}`, nil, nil, nil)
-	cred, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", etherealDir, filepath.Join(dir, "bind"))
+	cred, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", ephemeralDir, filepath.Join(dir, "bind"))
 	if !ok {
 		t.Fatalf("ok = false, want true for legacy unmarked container output")
 	}
-	if cred.IdentityClass != "ethereal" {
-		t.Fatalf("cred identity_class = %q, want ethereal", cred.IdentityClass)
+	if cred.IdentityClass != "ephemeral" {
+		t.Fatalf("cred identity_class = %q, want ephemeral", cred.IdentityClass)
 	}
 }
 
-func TestEphemeralDockerExecMintRejectsNonEtherealMarker(t *testing.T) {
+func TestEphemeralDockerExecMintRejectsNonEphemeralMarker(t *testing.T) {
 	dir := t.TempDir()
-	etherealDir := filepath.Join(dir, "ethereal")
-	_ = os.MkdirAll(etherealDir, 0o700)
+	ephemeralDir := filepath.Join(dir, "ephemeral")
+	_ = os.MkdirAll(ephemeralDir, 0o700)
 	stubContainerMint(t, `{"handle":"max.e-abcd1234","agent_secret":"as_ag_x","identity_class":"standard","base_url":"https://comt.dev"}`, nil, nil, nil)
-	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", etherealDir, filepath.Join(dir, "bind")); ok {
-		t.Fatalf("ok = true, want false for non-ethereal container output")
+	if _, _, ok := ephemeralTryDockerExecMint("sess1", "", "https://comt.dev", ephemeralDir, filepath.Join(dir, "bind")); ok {
+		t.Fatalf("ok = true, want false for non-ephemeral container output")
 	}
 }
 
@@ -140,7 +140,7 @@ func TestEphemeralEnsureDockerExecMintThenReuse(t *testing.T) {
 	prev := ephemeralContainerMint
 	ephemeralContainerMint = func(context.Context, string, string, string, string) ([]byte, error) {
 		calls++
-		return []byte(`{"handle":"max.e-d0c00001","agent_secret":"as_ag_dock_secret","identity_class":"ethereal","actor_id":"ai:max.e-d0c00001"}`), nil
+		return []byte(`{"handle":"max.e-d0c00001","agent_secret":"as_ag_dock_secret","identity_class":"ephemeral","actor_id":"ai:max.e-d0c00001"}`), nil
 	}
 	t.Cleanup(func() { ephemeralContainerMint = prev })
 
@@ -151,7 +151,7 @@ func TestEphemeralEnsureDockerExecMintThenReuse(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("container mint calls = %d, want 1", calls)
 	}
-	cred := filepath.Join(home, "ethereal", "max.e-d0c00001.json")
+	cred := filepath.Join(home, "ephemeral", "max.e-d0c00001.json")
 	if _, err := os.Stat(cred); err != nil {
 		t.Fatalf("cred not persisted to host store: %v", err)
 	}

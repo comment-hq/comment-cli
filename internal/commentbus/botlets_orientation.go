@@ -11,6 +11,11 @@ import (
 // BotletsTaskStartupFileNames are the bot brain files the agent should orient
 // from at the start of scheduled/task Botlets runs. Order matches OpenClaw
 // cron startup behavior and intentionally excludes MEMORY.md by default.
+// Scheduled runs also intentionally do NOT read the today/yesterday daily
+// notes that the interactive/main session reads (see BuildBotletsSetupOrientation
+// and BotletsSetupStartupFileNames): a cron run is isolated from session
+// history by design, so it orients only from the durable task-facing brain
+// files plus HEARTBEAT.md. Continuity across restarts is a main-session concern.
 var BotletsTaskStartupFileNames = []struct {
 	Name        string
 	Description string
@@ -146,6 +151,7 @@ func BuildBotletsSetupOrientation(input BotletsSetupOrientationInput) (string, e
 	for i, file := range BotletsSetupStartupFileNames {
 		fmt.Fprintf(&b, "%d. `%s` - %s\n", i+1, file.Name, file.Description)
 	}
+	b.WriteString("\nAlso read today's and yesterday's daily notes (`memory/YYYY-MM-DD.md` for today and the previous day) when present. They carry your continuity from recent sessions; a fresh runtime will not have them in context, so reading them is how you know what you already did before a restart. If neither file exists, there is nothing to read.\n")
 	b.WriteString("\n## Comment.io and Brain Writes\n\n")
 	b.WriteString("Before editing, archiving, or remembering anything in the brain, load the Comment.io API instructions now. Use the Comment.io skill if it is listed in this runtime. If it is not listed, read ")
 	b.WriteString(formatBotletsDocsReference(input.BaseURL, input.DocsRoot))

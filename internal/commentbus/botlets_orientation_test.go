@@ -37,6 +37,12 @@ func TestBuildBotletsTaskOrientationScheduled(t *testing.T) {
 	if strings.Index(body, "`HEARTBEAT.md`") < strings.Index(body, "`USER.md`") {
 		t.Fatalf("task orientation should list HEARTBEAT.md after USER.md: %q", body)
 	}
+	// Scheduled/cron runs are isolated from session history by design: they must
+	// NOT pull the today/yesterday daily notes that the interactive main session
+	// reads. Guard the boundary so the daily-note read doesn't leak into cron.
+	if strings.Contains(body, "daily notes") {
+		t.Fatalf("scheduled task orientation must not read daily notes (cron is isolated): %q", body)
+	}
 }
 
 func TestBuildBotletsTaskOrientationManualLabel(t *testing.T) {
@@ -111,6 +117,7 @@ func TestBuildBotletsSetupOrientationWithBootstrap(t *testing.T) {
 		"`AGENTS.md` - workspace rules and operating guidance",
 		"`MEMORY.md` - curated long-term bot memory",
 		"`HEARTBEAT.md` - recurring heartbeat and cron task instructions",
+		"Also read today's and yesterday's daily notes (`memory/YYYY-MM-DD.md` for today and the previous day) when present.",
 		"Before editing, archiving, or remembering anything in the brain, load the Comment.io API instructions now.",
 		"`/home/user/Comment Docs/_Comment.io Docs/llms.txt`",
 		"Do not use filesystem Edit/Write tools",

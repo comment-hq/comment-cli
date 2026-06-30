@@ -2696,8 +2696,31 @@ func (d *Daemon) writeSessionRecordLocked(record SessionRecord) error {
 	return WriteSessionRecord(d.paths, record)
 }
 
+// listSessionRecords wraps the lenient package reader, logging any individual
+// records it had to skip (malformed/invalid) so a poisoned record is visible in
+// the structured logs instead of silently disappearing — and, crucially, never
+// fails the whole read for one bad record (issue #1420).
+func (d *Daemon) listSessionRecords() ([]SessionRecord, error) {
+	records, skipped, err := ListSessionRecordsLenient(d.paths)
+	if err != nil {
+		return nil, err
+	}
+	if len(skipped) > 0 {
+		sample := skipped
+		if len(sample) > 10 {
+			sample = sample[:10]
+		}
+		d.logger.warn("session.records_skipped", map[string]any{
+			"count":       len(skipped),
+			"session_ids": sample,
+			"sampled":     len(sample) < len(skipped),
+		})
+	}
+	return records, nil
+}
+
 func (d *Daemon) aliveSessionForScopeLocked(profile string, botName string, scopeType string, scopeID string) (SessionRecord, bool, *SocketError) {
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return SessionRecord{}, false, socketError("UPSTREAM_ERROR", "could not read sessions", false)
 	}
@@ -2717,7 +2740,7 @@ func (d *Daemon) aliveSessionForScopeLocked(profile string, botName string, scop
 }
 
 func (d *Daemon) reconcileLiveSessionForScopeLocked(profile string, botName string, botID string, botAgentID string, scopeType string, scopeID string) (SessionRecord, bool, bool, []string, *SocketError) {
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return SessionRecord{}, false, false, nil, socketError("UPSTREAM_ERROR", "could not read sessions", false)
 	}
@@ -2877,7 +2900,7 @@ func (d *Daemon) fenceDuplicateLiveSessionLocked(record SessionRecord) ([]string
 }
 
 func (d *Daemon) hasStaleSessionForScopeLocked(profile string, botName string, scopeType string, scopeID string) (bool, *SocketError) {
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return false, socketError("UPSTREAM_ERROR", "could not read sessions", false)
 	}
@@ -3411,7 +3434,7 @@ func sessionCreatedBefore(record SessionRecord, resetAt time.Time) bool {
 }
 
 func (d *Daemon) dailyResetStateForTargetLocked(profile string, botName string, date string) (bool, SessionRecord, bool, *SocketError) {
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return false, SessionRecord{}, false, socketError("UPSTREAM_ERROR", "could not read sessions", false)
 	}
@@ -4008,7 +4031,7 @@ func (d *Daemon) sessionStatus(req SocketRequest) ([]SessionRecord, *SocketError
 		}
 		return filterSessions([]SessionRecord{record}, req.Params), nil
 	}
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return nil, socketError("UPSTREAM_ERROR", "could not read sessions", false)
 	}
@@ -5451,6 +5474,9 @@ func (d *Daemon) selectSessionForMutation(req SocketRequest) (SessionRecord, *So
 	if !hasSessionSelector(req.Params) {
 		return SessionRecord{}, socketError("VALIDATION_ERROR", "session operation requires a session selector", false)
 	}
+	// Mutating session operations must fail closed: lenient reads are for
+	// status/liveness paths only, because dropping one malformed record can hide
+	// an ambiguous or unauthorized mutation target.
 	records, err := ListSessionRecords(d.paths)
 	if err != nil {
 		return SessionRecord{}, socketError("UPSTREAM_ERROR", "could not read sessions", false)
@@ -6207,7 +6233,7 @@ func (d *Daemon) automaticNudgeBlockRecords() []SessionRecord {
 }
 
 func (d *Daemon) automaticNudgeBlockRecordsLocked() []SessionRecord {
-	records, err := ListSessionRecords(d.paths)
+	records, err := d.listSessionRecords()
 	if err != nil {
 		return nil
 	}

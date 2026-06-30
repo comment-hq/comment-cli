@@ -660,10 +660,15 @@ func botletsRunShortcutMatches(entry commentbus.BotRegistryEntry, selector strin
 }
 
 func botletsShortcutRuntimeArgs(runtime string, botName string) []string {
+	// Botlets are not Claude subagents — passing the unknown `--agent <bot>` flag
+	// makes Claude Code >= 2.1.x hard-error (`--agent '<bot>' not found`). Identity
+	// comes from the brain working dir + env injection, so we never pass it (issue
+	// #1420). botName is retained for signature symmetry with the codex path; it
+	// is no longer part of any Claude command.
 	if runtime == "codex" {
 		return []string{"--yolo"}
 	}
-	return []string{"--agent", botName, "--dangerously-skip-permissions"}
+	return []string{"--dangerously-skip-permissions"}
 }
 
 func resolveAgentProfileRunShortcut(paths commentbus.Paths, selector string) (commentbus.AgentProfile, error) {

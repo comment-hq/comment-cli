@@ -60,7 +60,7 @@ func TestEphemeralEnsureMintThenReuse(t *testing.T) {
 	if err := runEphemeralEnsure(args); err != nil {
 		t.Fatalf("mint returned error: %v", err)
 	}
-	cred := filepath.Join(home, "ethereal", "max.e-abcd1234.json")
+	cred := filepath.Join(home, "ephemeral", "max.e-abcd1234.json")
 	if mode(t, cred) != 0o600 {
 		t.Fatalf("cred mode = %v, want 0600", mode(t, cred))
 	}
@@ -72,8 +72,11 @@ func TestEphemeralEnsureMintThenReuse(t *testing.T) {
 	if err := json.Unmarshal(data, &stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.IdentityClass != "ethereal" {
-		t.Fatalf("cred identity_class = %q, want ethereal", stored.IdentityClass)
+	if stored.IdentityClass != "ephemeral" {
+		t.Fatalf("cred identity_class = %q, want ephemeral", stored.IdentityClass)
+	}
+	if _, err := os.Stat(filepath.Join(home, "ethereal")); !os.IsNotExist(err) {
+		t.Fatalf("fresh ensure created legacy ethereal dir: %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(home, "rewake", "bind-sess1")); strings.TrimSpace(string(b)) != "max.e-abcd1234" {
 		t.Fatalf("bind pointer = %q, want max.e-abcd1234", strings.TrimSpace(string(b)))
@@ -110,7 +113,7 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			credHandle:  "max.e-aaaa1111",
 			credSession: "sess_old",
 			secret:      "as_ag_t_secret",
-			identity:    "ethereal",
+			identity:    "ephemeral",
 		},
 		{
 			name:        "json handle mismatch",
@@ -119,7 +122,7 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			credHandle:  "max.e-cccc3333",
 			credSession: "sess_new",
 			secret:      "as_ag_t_secret",
-			identity:    "ethereal",
+			identity:    "ephemeral",
 		},
 		{
 			name:        "registered-looking handle",
@@ -128,7 +131,7 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			credHandle:  "max.reviewer",
 			credSession: "sess_new",
 			secret:      "as_ag_t_secret",
-			identity:    "ethereal",
+			identity:    "ephemeral",
 		},
 		{
 			name:        "dot-e registered-looking nonhex handle",
@@ -137,7 +140,7 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			credHandle:  "max.e-reviewer",
 			credSession: "sess_new",
 			secret:      "as_ag_t_secret",
-			identity:    "ethereal",
+			identity:    "ephemeral",
 		},
 		{
 			name:        "hex-shaped unmarked registered-looking handle",
@@ -154,16 +157,16 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			credHandle:  "max.e-dddd4444",
 			credSession: "sess_new",
 			secret:      "not-secret",
-			identity:    "ethereal",
+			identity:    "ephemeral",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			etherealDir := filepath.Join(home, "ethereal")
+			ephemeralDir := filepath.Join(home, "ephemeral")
 			rewakeDir := filepath.Join(home, "rewake")
-			if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+			if err := os.MkdirAll(ephemeralDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.MkdirAll(rewakeDir, 0o700); err != nil {
@@ -181,26 +184,130 @@ func TestEphemeralTryReuseRejectsForeignOrMismatchedCreds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(etherealDir, tc.fileHandle+".json"), data, 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(ephemeralDir, tc.fileHandle+".json"), data, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			bindFile := filepath.Join(rewakeDir, "bind-sess_new")
 			if err := os.WriteFile(bindFile, []byte(tc.bindHandle), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if c, p, ok := ephemeralTryReuse(etherealDir, bindFile, "sess_new", base); ok {
+			legacyDir := filepath.Join(home, "ethereal")
+			if c, p, ok := ephemeralTryReuse(ephemeralDir, legacyDir, bindFile, "sess_new", base, false); ok {
 				t.Fatalf("reused invalid credential: cred=%+v path=%s", c, p)
 			}
 		})
 	}
 }
 
+func TestEphemeralTryReuseMigratesLegacyStore(t *testing.T) {
+	clearEphemeralEnv(t)
+	const base = "https://comment.io"
+	home := t.TempDir()
+	ephemeralDir := filepath.Join(home, "ephemeral")
+	legacyDir := filepath.Join(home, "ethereal")
+	rewakeDir := filepath.Join(home, "rewake")
+	for _, dir := range []string{ephemeralDir, legacyDir, rewakeDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyCred := ephemeralCred{
+		Handle:        "max.e-11112222",
+		AgentSecret:   "as_ag_t_secret",
+		IdentityClass: "ethereal",
+		ExpiresAt:     "2999-01-01T00:00:00.000Z",
+		BaseURL:       base,
+		Session:       "sess_new",
+	}
+	data, err := json.Marshal(legacyCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "max.e-11112222.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bindFile := filepath.Join(rewakeDir, "bind-sess_new")
+	if err := os.WriteFile(bindFile, []byte("max.e-11112222"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cred, path, ok := ephemeralTryReuse(ephemeralDir, legacyDir, bindFile, "sess_new", base, true)
+	if !ok {
+		t.Fatal("legacy credential was not reused")
+	}
+	wantPath := filepath.Join(ephemeralDir, "max.e-11112222.json")
+	if path != wantPath || cred.IdentityClass != "ephemeral" {
+		t.Fatalf("reuse = (%+v, %s), want migrated ephemeral cred at %s", cred, path, wantPath)
+	}
+	var migrated ephemeralCred
+	migratedRaw, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(migratedRaw, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.IdentityClass != "ephemeral" {
+		t.Fatalf("migrated identity_class = %q, want ephemeral", migrated.IdentityClass)
+	}
+}
+
+func TestEphemeralTryReuseNormalizesCurrentLegacyMarker(t *testing.T) {
+	clearEphemeralEnv(t)
+	const base = "https://comment.io"
+	home := t.TempDir()
+	ephemeralDir := filepath.Join(home, "ephemeral")
+	legacyDir := filepath.Join(home, "ethereal")
+	rewakeDir := filepath.Join(home, "rewake")
+	for _, dir := range []string{ephemeralDir, rewakeDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyMarkedCred := ephemeralCred{
+		Handle:        "max.e-aaaabbbb",
+		AgentSecret:   "as_ag_t_secret",
+		IdentityClass: "ethereal",
+		ExpiresAt:     "2999-01-01T00:00:00.000Z",
+		BaseURL:       base,
+		Session:       "sess_new",
+	}
+	data, err := json.Marshal(legacyMarkedCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(ephemeralDir, "max.e-aaaabbbb.json")
+	if err := os.WriteFile(credPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bindFile := filepath.Join(rewakeDir, "bind-sess_new")
+	if err := os.WriteFile(bindFile, []byte("max.e-aaaabbbb"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cred, path, ok := ephemeralTryReuse(ephemeralDir, legacyDir, bindFile, "sess_new", base, false)
+	if !ok || path != credPath || cred.IdentityClass != "ephemeral" {
+		t.Fatalf("reuse = (%+v, %s, %v), want normalized current-store cred", cred, path, ok)
+	}
+	var stored ephemeralCred
+	updated, err := os.ReadFile(credPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(updated, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.IdentityClass != "ephemeral" {
+		t.Fatalf("stored identity_class = %q, want ephemeral", stored.IdentityClass)
+	}
+}
+
 func TestEphemeralEnsureRejectsBareRawResponseCred(t *testing.T) {
 	clearEphemeralEnv(t)
 	home := t.TempDir()
-	etherealDir := filepath.Join(home, "ethereal")
+	ephemeralDir := filepath.Join(home, "ephemeral")
 	rewakeDir := filepath.Join(home, "rewake")
-	if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+	if err := os.MkdirAll(ephemeralDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(rewakeDir, 0o700); err != nil {
@@ -211,7 +318,7 @@ func TestEphemeralEnsureRejectsBareRawResponseCred(t *testing.T) {
 	// session/base/identity metadata, it is only a bearer token, not a reachable
 	// session-scoped identity that `ensure` may safely reclaim.
 	rawCred := `{"agent_id":"ag_t","agent_secret":"as_ag_t_old","handle":"max.e-deadbeef","actor_id":"ai:max.e-deadbeef","display_name":"Fred","expires_at":"2999-01-01T00:00:00.000Z","owner":"max"}`
-	if err := os.WriteFile(filepath.Join(etherealDir, "max.e-deadbeef.json"), []byte(rawCred), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(ephemeralDir, "max.e-deadbeef.json"), []byte(rawCred), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(rewakeDir, "bind-sess_raw"), []byte("max.e-deadbeef"), 0o600); err != nil {
@@ -231,14 +338,14 @@ func TestEphemeralEnsureRejectsBareRawResponseCred(t *testing.T) {
 		t.Fatalf("bind pointer = %q, want reminted max.e-cafebabe", strings.TrimSpace(string(b)))
 	}
 	var stored ephemeralCred
-	data, err := os.ReadFile(filepath.Join(etherealDir, "max.e-cafebabe.json"))
+	data, err := os.ReadFile(filepath.Join(ephemeralDir, "max.e-cafebabe.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(data, &stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.IdentityClass != "ethereal" || stored.Session != "sess_raw" || stored.BaseURL == "" {
+	if stored.IdentityClass != "ephemeral" || stored.Session != "sess_raw" || stored.BaseURL == "" {
 		t.Fatalf("reminted cred missing reuse metadata: %+v", stored)
 	}
 }
@@ -258,11 +365,11 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 		wantMigrate bool
 	}{
 		{
-			name: "marked ethereal",
+			name: "marked ephemeral",
 			cred: ephemeralCred{
 				Handle:        handle,
 				AgentSecret:   "as_ag_t_secret",
-				IdentityClass: "ethereal",
+				IdentityClass: "ephemeral",
 				ExpiresAt:     "2999-01-01T00:00:00.000Z",
 				BaseURL:       base,
 				Session:       sess,
@@ -282,11 +389,24 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 			wantMigrate: true,
 		},
 		{
+			name: "legacy marked ephemeral",
+			cred: ephemeralCred{
+				Handle:        handle,
+				AgentSecret:   "as_ag_t_secret",
+				IdentityClass: "ethereal",
+				ExpiresAt:     "2999-01-01T00:00:00.000Z",
+				BaseURL:       base,
+				Session:       sess,
+			},
+			wantOK:      true,
+			wantMigrate: true,
+		},
+		{
 			name: "json handle mismatch",
 			cred: ephemeralCred{
 				Handle:        "max.e-deadbeef",
 				AgentSecret:   "as_ag_t_secret",
-				IdentityClass: "ethereal",
+				IdentityClass: "ephemeral",
 				ExpiresAt:     "2999-01-01T00:00:00.000Z",
 				BaseURL:       base,
 				Session:       sess,
@@ -297,7 +417,7 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 			cred: ephemeralCred{
 				Handle:        handle,
 				AgentSecret:   "as_ag_t_secret",
-				IdentityClass: "ethereal",
+				IdentityClass: "ephemeral",
 				ExpiresAt:     "2999-01-01T00:00:00.000Z",
 				BaseURL:       base,
 				Session:       "sess_old",
@@ -308,7 +428,7 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 			cred: ephemeralCred{
 				Handle:        handle,
 				AgentSecret:   "not-secret",
-				IdentityClass: "ethereal",
+				IdentityClass: "ephemeral",
 				ExpiresAt:     "2999-01-01T00:00:00.000Z",
 				BaseURL:       base,
 				Session:       sess,
@@ -330,9 +450,9 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			etherealDir := filepath.Join(home, "ethereal")
+			ephemeralDir := filepath.Join(home, "ephemeral")
 			bindFile := filepath.Join(home, "rewake", "bind-"+sess)
-			if err := os.MkdirAll(etherealDir, 0o700); err != nil {
+			if err := os.MkdirAll(ephemeralDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.MkdirAll(filepath.Dir(bindFile), 0o700); err != nil {
@@ -342,12 +462,12 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			credPath := filepath.Join(etherealDir, handle+".json")
+			credPath := filepath.Join(ephemeralDir, handle+".json")
 			if err := os.WriteFile(credPath, data, 0o600); err != nil {
 				t.Fatal(err)
 			}
 
-			cred, path, ok := ephemeralAcceptDaemonMintedCred(etherealDir, bindFile, handle, sess, base)
+			cred, path, ok := ephemeralAcceptDaemonMintedCred(ephemeralDir, filepath.Join(home, "ethereal"), bindFile, handle, sess, base)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v (cred=%+v path=%s)", ok, tc.wantOK, cred, path)
 			}
@@ -369,11 +489,56 @@ func TestEphemeralDaemonMintReadbackValidatesCredential(t *testing.T) {
 				if err := json.Unmarshal(data, &migrated); err != nil {
 					t.Fatal(err)
 				}
-				if migrated.IdentityClass != "ethereal" {
-					t.Fatalf("migrated identity_class = %q, want ethereal", migrated.IdentityClass)
+				if migrated.IdentityClass != "ephemeral" {
+					t.Fatalf("migrated identity_class = %q, want ephemeral", migrated.IdentityClass)
 				}
 			}
 		})
+	}
+}
+
+func TestEphemeralDaemonMintReadbackMigratesLegacyStore(t *testing.T) {
+	clearEphemeralEnv(t)
+	const (
+		base   = "https://comment.io"
+		handle = "max.e-feedc0de"
+		sess   = "sess_new"
+	)
+	home := t.TempDir()
+	ephemeralDir := filepath.Join(home, "ephemeral")
+	legacyDir := filepath.Join(home, "ethereal")
+	bindFile := filepath.Join(home, "rewake", "bind-"+sess)
+	for _, dir := range []string{ephemeralDir, legacyDir, filepath.Dir(bindFile)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyCred := ephemeralCred{
+		Handle:        handle,
+		AgentSecret:   "as_ag_t_secret",
+		IdentityClass: "ethereal",
+		ExpiresAt:     "2999-01-01T00:00:00.000Z",
+		BaseURL:       base,
+		Session:       sess,
+	}
+	data, err := json.Marshal(legacyCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, handle+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cred, path, ok := ephemeralAcceptDaemonMintedCred(ephemeralDir, legacyDir, bindFile, handle, sess, base)
+	if !ok {
+		t.Fatal("legacy daemon-minted credential was not accepted")
+	}
+	wantPath := filepath.Join(ephemeralDir, handle+".json")
+	if path != wantPath || cred.IdentityClass != "ephemeral" {
+		t.Fatalf("accepted legacy cred/path = %+v / %s, want migrated %s", cred, path, wantPath)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("migrated cred missing: %v", err)
 	}
 }
 
@@ -411,9 +576,9 @@ func TestEphemeralEnsureNoArkNoSessionExit2(t *testing.T) {
 func TestEphemeralEnsureNoArkUnusableStoreStillExit2(t *testing.T) {
 	clearEphemeralEnv(t)
 	home := t.TempDir()
-	// Unusable store (ethereal is a stale file) AND no ark key: the no-ark path
+	// Unusable store (ephemeral is a stale file) AND no ark key: the no-ark path
 	// must still degrade to anonymous (exit 2), not hard-fail securing the store.
-	if err := os.WriteFile(filepath.Join(home, "ethereal"), []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "ephemeral"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	err := runEphemeralEnsure([]string{"--home", home, "--base-url", "https://comt.dev", "--session", "s"})
@@ -461,7 +626,7 @@ func TestEphemeralEnsureMalformedHandleRejected(t *testing.T) {
 		t.Fatalf("want malformed-handle error, got %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(home, "pwn.json")); statErr == nil {
-		t.Fatal("path-traversal handle wrote a file outside the ethereal dir")
+		t.Fatal("path-traversal handle wrote a file outside the ephemeral dir")
 	}
 }
 
@@ -526,7 +691,7 @@ func TestEphemeralHardenDirRejectsUnusableStore(t *testing.T) {
 	home := t.TempDir()
 	// A path that already exists as a regular file (not a directory) cannot hold
 	// credentials — secureDir must fail before any mint.
-	bad := filepath.Join(home, "ethereal")
+	bad := filepath.Join(home, "ephemeral")
 	if err := os.WriteFile(bad, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +701,7 @@ func TestEphemeralHardenDirRejectsUnusableStore(t *testing.T) {
 }
 
 func TestEphemeralHardenDirPurgesPreviouslyWritable(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "ethereal")
+	dir := filepath.Join(t.TempDir(), "ephemeral")
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +733,7 @@ func TestEphemeralHardenDirPurgesPreviouslyWritable(t *testing.T) {
 	}
 
 	// A never-writable dir keeps its own contents.
-	fresh := filepath.Join(t.TempDir(), "ethereal")
+	fresh := filepath.Join(t.TempDir(), "ephemeral")
 	if err := ephemeralHardenDir(fresh); err != nil {
 		t.Fatalf("fresh dir: %v", err)
 	}

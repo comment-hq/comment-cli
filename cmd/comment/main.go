@@ -509,6 +509,7 @@ func runDaemonWithContext(ctx context.Context, home string, botletsHome string, 
 	reconcileAutoUpdatePostStart(ctx, paths, botletsHome)
 	startSyncWorker(ctx, paths)
 	startBotletsTeamResyncWorker(ctx, paths, botletsHome)
+	startBotletsTeamInstallWorker(ctx, paths, botletsHome)
 	startAgentEnrollmentWorker(ctx, paths, botletsHome)
 	startAgentRuntimeRequestWorker(ctx, paths)
 	startOwnedAgentsReconciler(ctx, paths, botletsHome)

@@ -65,6 +65,22 @@ type busPairStartResponse struct {
 	ExpiresIn               int    `json:"expires_in"`
 }
 
+const busPairPendingFileName = "daemon-pair-pending.json"
+
+type busPairPending struct {
+	Version                 int    `json:"version"`
+	BaseURL                 string `json:"base_url"`
+	Label                   string `json:"label"`
+	Force                   bool   `json:"force"`
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	Interval                int    `json:"interval"`
+	StartedAt               string `json:"started_at"`
+	ExpiresAt               string `json:"expires_at"`
+}
+
 type busPairRedeemResponse struct {
 	DaemonToken  string   `json:"daemon_token"`
 	DaemonID     string   `json:"daemon_id"`
@@ -73,6 +89,7 @@ type busPairRedeemResponse struct {
 	Capabilities []string `json:"capabilities"`
 	Error        string   `json:"error"`
 	Code         string   `json:"code"`
+	Retryable    bool     `json:"retryable"`
 	Interval     int      `json:"interval"`
 }
 
@@ -82,33 +99,54 @@ func runBusPair(args []string) error {
 	label := fs.String("label", "", "computer name shown in the web app (default: this computer's hostname)")
 	baseURL := fs.String("base-url", commentsync.DefaultBaseURL(), "Comment.io base URL")
 	force := fs.Bool("force", false, "pair again even if this computer already has daemon credentials")
+	cliMode := fs.Bool("cli", false, "print an approval URL/code and exit; finish later with --resume")
+	resume := fs.Bool("resume", false, "finish a pending --cli pairing after browser approval")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if len(fs.Args()) > 0 {
 		return errors.New("bus pair does not accept positional arguments")
 	}
+	if *cliMode && *resume {
+		return errors.New("bus pair cannot use --cli and --resume together")
+	}
+	if *resume {
+		return busPairResume(os.Stdout, *home)
+	}
+	if *cliMode {
+		return busPairCLI(os.Stdout, *home, *label, *baseURL, *force)
+	}
 	return busPair(os.Stdout, *home, *label, *baseURL, *force)
 }
 
-func busPair(out io.Writer, home string, label string, baseURL string, force bool) error {
+type busPairSession struct {
+	Paths   commentbus.Paths
+	Auth    commentbus.DaemonAuth
+	Paired  bool
+	LoadErr error
+	Base    string
+	Label   string
+	Start   busPairStartResponse
+}
+
+func startBusPairSession(out io.Writer, home string, label string, baseURL string, force bool) (busPairSession, bool, error) {
 	paths, err := resolveCLIPaths(home)
 	if err != nil {
-		return err
+		return busPairSession{}, false, err
 	}
 	auth, paired, loadErr := commentbus.LoadDaemonAuth(paths)
 	if loadErr != nil && !force {
-		return fmt.Errorf("existing daemon credentials are unreadable (%s); re-run with --force to replace them", loadErr.Error())
+		return busPairSession{}, false, fmt.Errorf("existing daemon credentials are unreadable (%s); re-run with --force to replace them", loadErr.Error())
 	}
 	if paired && !force {
 		fmt.Fprintf(out, "already paired as %q (daemon %s)\n", auth.Label, auth.DaemonID)
 		fmt.Fprintln(out, "Re-run with --force to pair this computer again.")
-		return nil
+		return busPairSession{}, false, nil
 	}
 
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" {
-		return errors.New("bus pair requires a base URL")
+		return busPairSession{}, false, errors.New("bus pair requires a base URL")
 	}
 	if strings.TrimSpace(label) == "" {
 		hostname, _ := os.Hostname()
@@ -118,20 +156,34 @@ func busPair(out io.Writer, home string, label string, baseURL string, force boo
 	ctx := context.Background()
 	start, err := busPairStart(ctx, base, label)
 	if err != nil {
+		return busPairSession{}, false, err
+	}
+	return busPairSession{Paths: paths, Auth: auth, Paired: paired, LoadErr: loadErr, Base: base, Label: label, Start: start}, true, nil
+}
+
+func busPair(out io.Writer, home string, label string, baseURL string, force bool) error {
+	session, started, err := startBusPairSession(out, home, label, baseURL, force)
+	if err != nil || !started {
 		return err
 	}
+	start := session.Start
 	expiresIn := time.Duration(start.ExpiresIn) * time.Second
-	renderPairingPrompt(out, base, start)
+	renderPairingPrompt(out, session.Base, start)
 	// The wait status streams as plain prose BELOW the closed panel — the panel
 	// is the "what to do" card; this line and the periodic heartbeats from the
 	// poll loop are ongoing status, so they read as a consistent stream instead
 	// of dangling after the box's bottom rule.
 	fmt.Fprintf(out, "Waiting for you to approve it… (the code expires in %s)\n", expiresIn)
 
-	redeemed, err := busPairPollRedeem(ctx, base, start, out)
+	ctx := context.Background()
+	redeemed, err := busPairPollRedeem(ctx, session.Base, start, out)
 	if err != nil {
 		return err
 	}
+	return finishBusPair(ctx, out, session.Paths, session.Auth, session.Paired, session.LoadErr, session.Label, session.Base, force, redeemed)
+}
+
+func finishBusPair(ctx context.Context, out io.Writer, paths commentbus.Paths, auth commentbus.DaemonAuth, paired bool, loadErr error, label string, base string, force bool, redeemed busPairRedeemResponse) error {
 	savedLabel := redeemed.Label
 	if savedLabel == "" {
 		savedLabel = label
@@ -202,14 +254,162 @@ func busPair(out io.Writer, home string, label string, baseURL string, force boo
 	return nil
 }
 
+func busPairCLI(out io.Writer, home string, label string, baseURL string, force bool) error {
+	session, started, err := startBusPairSession(out, home, label, baseURL, force)
+	if err != nil || !started {
+		return err
+	}
+	now := time.Now().UTC()
+	pending := busPairPending{
+		Version:                 1,
+		BaseURL:                 session.Base,
+		Label:                   session.Label,
+		Force:                   force,
+		DeviceCode:              session.Start.DeviceCode,
+		UserCode:                session.Start.UserCode,
+		VerificationURI:         session.Start.VerificationURI,
+		VerificationURIComplete: session.Start.VerificationURIComplete,
+		Interval:                session.Start.Interval,
+		StartedAt:               now.Format(time.RFC3339),
+		ExpiresAt:               now.Add(time.Duration(session.Start.ExpiresIn) * time.Second).Format(time.RFC3339),
+	}
+	if err := saveBusPairPending(session.Paths, pending); err != nil {
+		return err
+	}
+	renderBusPairCLI(out, session.Paths, pending)
+	return nil
+}
+
+func busPairResume(out io.Writer, home string) error {
+	paths, err := resolveCLIPaths(home)
+	if err != nil {
+		return err
+	}
+	pending, ok, err := loadBusPairPending(paths)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("no pending CLI pairing found; run `comment bus pair --cli` first")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, pending.ExpiresAt)
+	if err != nil {
+		return errors.New("pending CLI pairing is unreadable; run `comment bus pair --cli` again")
+	}
+	remaining := time.Until(expiresAt)
+	if remaining <= 0 {
+		_ = deleteBusPairPending(paths)
+		return errors.New("pending CLI pairing expired; run `comment bus pair --cli` again")
+	}
+
+	auth, paired, loadErr := commentbus.LoadDaemonAuth(paths)
+	if loadErr != nil && !pending.Force {
+		return fmt.Errorf("existing daemon credentials are unreadable (%s); re-run `comment bus pair --cli --force` to replace them", loadErr.Error())
+	}
+	if paired && !pending.Force {
+		_ = deleteBusPairPending(paths)
+		fmt.Fprintf(out, "already paired as %q (daemon %s)\n", auth.Label, auth.DaemonID)
+		fmt.Fprintln(out, "Re-run with --force to pair this computer again.")
+		return nil
+	}
+
+	start := busPairStartResponse{
+		DeviceCode:              pending.DeviceCode,
+		UserCode:                pending.UserCode,
+		VerificationURI:         pending.VerificationURI,
+		VerificationURIComplete: pending.VerificationURIComplete,
+		Interval:                pending.Interval,
+		ExpiresIn:               int(remaining.Round(time.Second) / time.Second),
+	}
+	if start.ExpiresIn <= 0 {
+		start.ExpiresIn = 1
+	}
+	fmt.Fprintf(out, "Finishing pending Comment.io pairing for %s. If it is not approved yet, open %s and enter code %s.\n", strings.TrimRight(pending.BaseURL, "/"), pending.VerificationURIComplete, pending.UserCode)
+	ctx := context.Background()
+	redeemed, err := busPairPollRedeem(ctx, pending.BaseURL, start, out)
+	if err != nil {
+		return err
+	}
+	if err := finishBusPair(ctx, out, paths, auth, paired, loadErr, pending.Label, pending.BaseURL, pending.Force, redeemed); err != nil {
+		return err
+	}
+	_ = deleteBusPairPending(paths)
+	return nil
+}
+
+func busPairPendingPath(paths commentbus.Paths) string {
+	return filepath.Join(paths.Bus, busPairPendingFileName)
+}
+
+func saveBusPairPending(paths commentbus.Paths, pending busPairPending) error {
+	data, err := json.MarshalIndent(pending, "", "  ")
+	if err != nil {
+		return err
+	}
+	return commentbus.WritePrivateFileAtomic(busPairPendingPath(paths), append(data, '\n'), 0o600)
+}
+
+func loadBusPairPending(paths commentbus.Paths) (busPairPending, bool, error) {
+	path := busPairPendingPath(paths)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return busPairPending{}, false, nil
+	}
+	if err != nil {
+		return busPairPending{}, false, errors.New("could not inspect pending CLI pairing")
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return busPairPending{}, false, errors.New("pending CLI pairing file must not be a symlink")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return busPairPending{}, false, errors.New("could not read pending CLI pairing")
+	}
+	var pending busPairPending
+	if err := json.Unmarshal(data, &pending); err != nil {
+		return busPairPending{}, false, errors.New("pending CLI pairing is not valid JSON")
+	}
+	if pending.Version != 1 || strings.TrimSpace(pending.BaseURL) == "" || strings.TrimSpace(pending.DeviceCode) == "" || strings.TrimSpace(pending.UserCode) == "" || strings.TrimSpace(pending.VerificationURIComplete) == "" || strings.TrimSpace(pending.ExpiresAt) == "" {
+		return busPairPending{}, false, errors.New("pending CLI pairing is missing required fields")
+	}
+	if pending.Interval <= 0 {
+		pending.Interval = int(busPairDefaultInterval / time.Second)
+	}
+	return pending, true, nil
+}
+
+func deleteBusPairPending(paths commentbus.Paths) error {
+	if err := os.Remove(busPairPendingPath(paths)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func renderBusPairCLI(out io.Writer, paths commentbus.Paths, pending busPairPending) {
+	fmt.Fprintln(out, "Comment.io pairing needs browser approval.")
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "Approval URL: %s\n", pending.VerificationURIComplete)
+	fmt.Fprintf(out, "Code: %s\n", pending.UserCode)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "After approving it in the browser, finish pairing with:")
+	fmt.Fprintf(out, "  %s\n", busPairResumeCommand(paths.Home))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Agents: send the Approval URL and Code to the human, wait for approval, then run the finish command above.")
+}
+
+func busPairResumeCommand(home string) string {
+	return "comment bus pair --resume --home " + shellQuoteArg(home)
+}
+
 // renderPairingPrompt draws the "approve this in your browser" step as a framed
 // action card so it interrupts the install log stream — the structure is what
-// makes the eye stop on the one moment that needs a human. The card holds only
-// the action and the two things to act on (link + code); the wait status streams
-// as plain prose below it (see busPair) so the box closes cleanly on the code.
-// Emphasis is deliberately restrained: bold "ACTION REQUIRED" and a bold code,
-// no glyph markers or reverse-video badges. The only color is the cyan box rule
-// (a border, not text), matching the `comment status` readiness panel. Color
+// makes the eye stop on the one moment that needs a human. The card makes the
+// complete link the primary action; the short code is fallback text for manual
+// entry if the URL query is lost. The wait status streams as plain prose below
+// it (see busPair) so the box closes cleanly on the fallback. Emphasis is
+// deliberately restrained: bold "ACTION REQUIRED", no glyph markers or
+// reverse-video badges. The only color is the cyan box rule (a border, not text),
+// matching the `comment status` readiness panel. Color
 // auto-disables on non-TTY / NO_COLOR / dumb terminals via colorEnabled, so
 // piped installs and tests get clean plain text.
 func renderPairingPrompt(out io.Writer, base string, start busPairStartResponse) {
@@ -221,7 +421,7 @@ func renderPairingPrompt(out io.Writer, base string, start busPairStartResponse)
 	fmt.Fprintf(out, "%s   to link it to %s\n", bar(color), strings.TrimRight(base, "/"))
 	fmt.Fprintln(out, bar(color))
 	fmt.Fprintf(out, "%s   Open:  %s\n", bar(color), start.VerificationURIComplete)
-	fmt.Fprintf(out, "%s   Code:  %s\n", bar(color), paint(color, start.UserCode, ansiBold))
+	fmt.Fprintf(out, "%s   If the page asks for a code, enter: %s\n", bar(color), paint(color, start.UserCode, ansiBold))
 	bottomRule(out, color)
 	fmt.Fprintln(out)
 }
@@ -280,6 +480,8 @@ func busPairPollRedeem(ctx context.Context, base string, start busPairStartRespo
 	interval := time.Duration(start.Interval) * time.Second
 	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
 	transportFailures := 0
+	retryableServerProblem := ""
+	announcedRetryableServerProblem := ""
 	// Reprint a progress line every busPairHeartbeatInterval of polling so the
 	// wait for the user's browser approval doesn't look like a hang. Driven by
 	// accumulated poll-sleep (not wall clock) so it's deterministic under the
@@ -287,6 +489,9 @@ func busPairPollRedeem(ctx context.Context, base string, start busPairStartRespo
 	sinceHeartbeat := time.Duration(0)
 	for {
 		if time.Now().After(deadline) {
+			if retryableServerProblem != "" {
+				return busPairRedeemResponse{}, busPairApprovedExpiredError(retryableServerProblem)
+			}
 			return busPairRedeemResponse{}, errors.New("pairing was not approved before the code expired; run `comment bus pair` again")
 		}
 		busPairSleep(interval)
@@ -295,7 +500,11 @@ func busPairPollRedeem(ctx context.Context, base string, start busPairStartRespo
 			sinceHeartbeat = 0
 			if out != nil {
 				if remaining := time.Until(deadline).Round(time.Second); remaining > 0 {
-					fmt.Fprintf(out, "  …still waiting for you to approve this computer in your browser (%s left). Open %s and enter code %s.\n", remaining, start.VerificationURIComplete, start.UserCode)
+					if retryableServerProblem != "" {
+						fmt.Fprintf(out, "  …pairing was approved; still waiting for Comment.io to finish registering this computer (%s left; last server response: %s).\n", remaining, retryableServerProblem)
+					} else {
+						fmt.Fprintf(out, "  …still waiting for you to approve this computer in your browser (%s left). Open %s. If the page asks for a code, enter %s.\n", remaining, start.VerificationURIComplete, start.UserCode)
+					}
 				}
 			}
 		}
@@ -333,8 +542,21 @@ func busPairPollRedeem(ctx context.Context, base string, start busPairStartRespo
 			}
 			interval += busPairSlowDownPadding
 		case status == http.StatusGone:
+			if retryableServerProblem != "" {
+				return busPairRedeemResponse{}, busPairApprovedExpiredError(retryableServerProblem)
+			}
 			return busPairRedeemResponse{}, errors.New("the pairing code expired before it was approved; run `comment bus pair` again")
 		case status == http.StatusConflict:
+			if redeem.Code == "PAIR_OWNER_PROFILE_MISSING" {
+				message := strings.TrimSpace(redeem.Error)
+				if message == "" {
+					message = "we could not verify your Comment.io account for pairing; sign out and back in, then run `comment bus pair` again; if this keeps happening, contact us"
+				}
+				if !strings.Contains(message, "comment bus pair") {
+					message += "; then run `comment bus pair` again"
+				}
+				return busPairRedeemResponse{}, errors.New(message)
+			}
 			// Either another terminal completed the pairing, or an earlier poll
 			// from THIS terminal committed it but the response was lost in
 			// transit (the token is delivered exactly once and cannot be
@@ -344,10 +566,36 @@ func busPairPollRedeem(ctx context.Context, base string, start busPairStartRespo
 			return busPairRedeemResponse{}, errors.New("the server no longer recognizes this pairing code; run `comment bus pair` again")
 		case status == http.StatusServiceUnavailable:
 			// Retryable server-side hiccup (e.g. daemon registration failed);
-			// the code is still live, keep polling.
+			// the code is still live, keep polling. Only explicit retryable
+			// pairing errors are post-approval; a generic edge/proxy 503 can
+			// happen before approval and must not flip the user-facing state.
+			if problem, ok := busPairPostApprovalRetryableServerProblem(redeem); ok {
+				retryableServerProblem = problem
+				if out != nil && retryableServerProblem != announcedRetryableServerProblem {
+					fmt.Fprintf(out, "  Pairing was approved; Comment.io is retrying server-side registration (last server response: %s).\n", retryableServerProblem)
+					announcedRetryableServerProblem = retryableServerProblem
+				}
+			}
 		default:
 			return busPairRedeemResponse{}, fmt.Errorf("pairing failed: HTTP %d", status)
 		}
+	}
+}
+
+func busPairApprovedExpiredError(serverProblem string) error {
+	return fmt.Errorf("pairing was approved, but Comment.io could not finish registering this computer before the code expired (last server response: %s); run `comment bus pair` again", serverProblem)
+}
+
+func busPairPostApprovalRetryableServerProblem(redeem busPairRedeemResponse) (string, bool) {
+	if !redeem.Retryable {
+		return "", false
+	}
+	code := strings.TrimSpace(redeem.Code)
+	switch code {
+	case "PAIR_REGISTER_FAILED", "PAIR_COMMIT_FAILED":
+		return code, true
+	default:
+		return "", false
 	}
 }
 

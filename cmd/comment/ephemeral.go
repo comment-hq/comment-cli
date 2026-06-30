@@ -27,11 +27,11 @@ import (
 )
 
 // `comment ephemeral ensure` idempotently gives THIS agent session a named,
-// session-scoped "ethereal" identity: it reuses an existing live credential
+// session-scoped "ephemeral" identity: it reuses an existing live credential
 // bound to the session, or mints one via POST /agents/ephemeral (ark_ auth) and
 // persists it. It is the reliable, single-command equivalent of the shell
 // `ensure-session-identity` helper shipped with the comment-identity skill, and
-// uses the SAME on-disk layout (ethereal/<handle>.json + rewake/bind-<session>)
+// uses the SAME on-disk layout (ephemeral/<handle>.json + rewake/bind-<session>)
 // so the Claude asyncRewake wake-hook and the shell fallback interoperate.
 //
 // Exit codes mirror the shell helper:
@@ -49,12 +49,12 @@ const (
 )
 
 var (
-	ephemeralEtherealHandleRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*[.]e-[0-9a-f]{8}$`)
-	ephemeralSecretRE         = regexp.MustCompile(`^as_[A-Za-z0-9._-]+$`)
-	ephemeralSafeKey          = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	ephemeralHandleRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*[.]e-[0-9a-f]{8}$`)
+	ephemeralSecretRE = regexp.MustCompile(`^as_[A-Za-z0-9._-]+$`)
+	ephemeralSafeKey  = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
 
-// ephemeralCred is the on-disk shape under ~/.comment-io/ethereal/<handle>.json.
+// ephemeralCred is the on-disk shape under ~/.comment-io/ephemeral/<handle>.json.
 // It matches what the shell helper and the /listen skill write.
 type ephemeralCred struct {
 	Handle        string `json:"handle"`
@@ -82,7 +82,7 @@ func runEphemeral(args []string) error {
 
 func ephemeralUsage() string {
 	return strings.Join([]string{
-		"Give this agent session a named, session-scoped ethereal identity.",
+		"Give this agent session a named, session-scoped ephemeral identity.",
 		"",
 		"Usage:",
 		"  comment ephemeral ensure [flags]",
@@ -159,7 +159,8 @@ func runEphemeralEnsure(args []string) error {
 	}
 
 	rewakeDir := filepath.Join(paths.Home, "rewake")
-	etherealDir := filepath.Join(paths.Home, "ethereal")
+	ephemeralDir := filepath.Join(paths.Home, "ephemeral")
+	legacyEphemeralDir := filepath.Join(paths.Home, "ethereal")
 	safe := ephemeralSanitizeKey(sess)
 	bindFile := filepath.Join(rewakeDir, "bind-"+safe)
 	lockFile := filepath.Join(rewakeDir, ".ensure-"+safe+".lock")
@@ -170,8 +171,9 @@ func runEphemeralEnsure(args []string) error {
 	// only before minting, so a no-ark read-only store can still go anonymous.
 	storeErr := ephemeralHardenDir(rewakeDir)
 	if storeErr == nil {
-		storeErr = ephemeralHardenDir(etherealDir)
+		storeErr = ephemeralHardenDir(ephemeralDir)
 	}
+	legacyStoreErr := ephemeralHardenExistingDir(legacyEphemeralDir)
 	// Harden PURGES a previously-tamperable store, so a secured store is safe to
 	// reuse from. "secure" gates all reuse below.
 	secure := storeErr == nil
@@ -179,7 +181,7 @@ func runEphemeralEnsure(args []string) error {
 	// Fast path: reuse a live credential bound to this session — only from a
 	// secured store.
 	if secure {
-		if cred, credPath, ok := ephemeralTryReuse(etherealDir, bindFile, sess, base); ok {
+		if cred, credPath, ok := ephemeralTryReuse(ephemeralDir, legacyEphemeralDir, bindFile, sess, base, legacyStoreErr == nil); ok {
 			ephemeralArmClaudeBind(rewakeDir, cred.Handle)
 			return ephemeralPrint(*jsonOut, *printSecret, cred, credPath)
 		}
@@ -194,7 +196,7 @@ func runEphemeralEnsure(args []string) error {
 		mintBlock = ephemeralVerifyWritable(rewakeDir)
 	}
 	if mintBlock == nil {
-		mintBlock = ephemeralVerifyWritable(etherealDir)
+		mintBlock = ephemeralVerifyWritable(ephemeralDir)
 	}
 	if mintBlock != nil {
 		if ark == "" {
@@ -213,7 +215,7 @@ func runEphemeralEnsure(args []string) error {
 		if !secure {
 			return ephemeralCred{}, "", false
 		}
-		return ephemeralTryReuse(etherealDir, bindFile, sess, base)
+		return ephemeralTryReuse(ephemeralDir, legacyEphemeralDir, bindFile, sess, base, legacyStoreErr == nil)
 	})
 	if reuse, reusePath, ok := acquired.reuse, acquired.reusePath, acquired.reused; ok {
 		ephemeralArmClaudeBind(rewakeDir, reuse.Handle)
@@ -232,7 +234,7 @@ func runEphemeralEnsure(args []string) error {
 	// Double-check after acquiring: a racer may have minted between checks (only
 	// from a secured store — same guard as the fast path).
 	if secure {
-		if cred, credPath, ok := ephemeralTryReuse(etherealDir, bindFile, sess, base); ok {
+		if cred, credPath, ok := ephemeralTryReuse(ephemeralDir, legacyEphemeralDir, bindFile, sess, base, legacyStoreErr == nil); ok {
 			ephemeralArmClaudeBind(rewakeDir, cred.Handle)
 			return ephemeralPrint(*jsonOut, *printSecret, cred, credPath)
 		}
@@ -241,7 +243,7 @@ func runEphemeralEnsure(args []string) error {
 	// Mint under the lock. No ark key ⇒ the paired daemon mints with its OWN
 	// pairing token (no ark_ key on disk); otherwise mint directly with the key.
 	if ark == "" {
-		if cred, credPath, ok := ephemeralTryDaemonMint(paths, sess, *name, base, etherealDir, bindFile); ok {
+		if cred, credPath, ok := ephemeralTryDaemonMint(paths, sess, *name, base, ephemeralDir, legacyEphemeralDir, bindFile); ok {
 			ephemeralArmClaudeBind(rewakeDir, cred.Handle)
 			return ephemeralPrint(*jsonOut, *printSecret, cred, credPath)
 		}
@@ -249,14 +251,14 @@ func runEphemeralEnsure(args []string) error {
 		// daemon (and its socket + ldt_) live in a Docker container the host can't
 		// reach directly. Mint by exec-ing into that container; only the short-lived
 		// ephemeral secret crosses back to the host store (the socket/token never do).
-		if cred, credPath, ok := ephemeralTryDockerExecMint(sess, *name, base, etherealDir, bindFile); ok {
+		if cred, credPath, ok := ephemeralTryDockerExecMint(sess, *name, base, ephemeralDir, bindFile); ok {
 			ephemeralArmClaudeBind(rewakeDir, cred.Handle)
 			return ephemeralPrint(*jsonOut, *printSecret, cred, credPath)
 		}
 		return ephemeralNoMintAnonymous(paths, base)
 	}
 
-	cred, credPath, err := ephemeralMint(base, ark, *name, sess, etherealDir, bindFile)
+	cred, credPath, err := ephemeralMint(base, ark, *name, sess, ephemeralDir, bindFile)
 	if err != nil {
 		return err
 	}
@@ -322,13 +324,13 @@ func ephemeralResolveDaemonBase(ark string, paths commentbus.Paths) string {
 }
 
 // ephemeralTryDaemonMint asks the locally-paired daemon to mint a session-scoped
-// ethereal handle. The daemon mints with its OWN pairing token (no ark_ key on
+// ephemeral handle. The daemon mints with its OWN pairing token (no ark_ key on
 // disk), persists the secret-bearing cred file itself, and returns only the
 // handle + cred path — so the secret never crosses the socket. We read that cred
 // back, best-effort write the session bind, and hand it to the caller. Returns
 // false (→ caller degrades to anonymous) when there is no reachable/paired
 // daemon or the mint failed.
-func ephemeralTryDaemonMint(paths commentbus.Paths, sess, name, base, etherealDir, bindFile string) (ephemeralCred, string, bool) {
+func ephemeralTryDaemonMint(paths commentbus.Paths, sess, name, base, ephemeralDir, legacyEphemeralDir, bindFile string) (ephemeralCred, string, bool) {
 	// Need a reachable daemon: a live Unix socket, OR the opt-in TCP transport
 	// (COMMENT_IO_BUS_TCP_ADDR — the caged-daemon path, where paths.Socket may be
 	// empty/absent but callSocket dials BusTCPAddr).
@@ -367,33 +369,40 @@ func ephemeralTryDaemonMint(paths commentbus.Paths, sess, name, base, etherealDi
 	}
 	result, _ := resp.Result.(map[string]any)
 	handle, _ := result["handle"].(string)
-	return ephemeralAcceptDaemonMintedCred(etherealDir, bindFile, handle, sess, base)
+	return ephemeralAcceptDaemonMintedCred(ephemeralDir, legacyEphemeralDir, bindFile, handle, sess, base)
 }
 
-func ephemeralAcceptDaemonMintedCred(etherealDir, bindFile, handle, sess, base string) (ephemeralCred, string, bool) {
+func ephemeralAcceptDaemonMintedCred(ephemeralDir, legacyEphemeralDir, bindFile, handle, sess, base string) (ephemeralCred, string, bool) {
 	// Validate before using as a filename (it came over the socket).
-	if !ephemeralEtherealHandleOK(handle) {
+	if !ephemeralHandleOK(handle) {
 		return ephemeralCred{}, "", false
 	}
 	// Read the cred back from OUR OWN store, not the daemon's reported cred_file:
 	// in the Docker cage the daemon's home (e.g. /state) differs from the host
 	// CLI's bind-mounted COMMENT_IO_HOME, so its absolute path is not valid here.
-	credPath := filepath.Join(etherealDir, handle+".json")
+	credPath := filepath.Join(ephemeralDir, handle+".json")
 	cred, credOK := ephemeralReadCred(credPath)
 	if !credOK {
-		return ephemeralCred{}, "", false
+		if ephemeralHardenExistingDir(legacyEphemeralDir) != nil {
+			return ephemeralCred{}, "", false
+		}
+		var migrated bool
+		cred, credPath, migrated = ephemeralTryMigrateLegacyCred(legacyEphemeralDir, ephemeralDir, handle, sess, base)
+		if !migrated {
+			return ephemeralCred{}, "", false
+		}
 	}
-	if cred.IdentityClass == "" {
+	if cred.IdentityClass == "" || cred.IdentityClass == "ethereal" {
 		if cred.Handle != handle ||
 			sess == "" ||
 			cred.Session != sess ||
-			!ephemeralEtherealHandleOK(cred.Handle) ||
+			!ephemeralHandleOK(cred.Handle) ||
 			!ephemeralSecretRE.MatchString(cred.AgentSecret) ||
 			!ephemeralCredLive(cred) ||
 			!ephemeralSameBase(cred, base) {
 			return ephemeralCred{}, "", false
 		}
-		cred.IdentityClass = "ethereal"
+		cred.IdentityClass = "ephemeral"
 		data, err := json.Marshal(cred)
 		if err != nil || commentbus.WritePrivateFileAtomic(credPath, data, 0o600) != nil {
 			return ephemeralCred{}, "", false
@@ -494,9 +503,19 @@ func ephemeralHardenDir(dir string) error {
 	return nil
 }
 
+func ephemeralHardenExistingDir(dir string) error {
+	if _, err := os.Lstat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return ephemeralHardenDir(dir)
+}
+
 // ephemeralVerifyWritable confirms we can ACTUALLY persist a one-time secret
 // here before minting: a 0700 dir we do not own (e.g. created by sudo) passes
-// the perm check but fails the write, consuming an ethereal slot and losing the
+// the perm check but fails the write, consuming an ephemeral slot and losing the
 // credential. A temp-file probe is the portable way to test writability.
 func ephemeralVerifyWritable(dir string) error {
 	probe, err := os.CreateTemp(dir, ".probe-*")
@@ -546,8 +565,12 @@ func ephemeralSameBase(c ephemeralCred, base string) bool {
 	return b != "" && b == strings.TrimRight(base, "/")
 }
 
-func ephemeralEtherealHandleOK(handle string) bool {
-	return ephemeralEtherealHandleRE.MatchString(handle) && !strings.Contains(handle, "..")
+func ephemeralHandleOK(handle string) bool {
+	return ephemeralHandleRE.MatchString(handle) && !strings.Contains(handle, "..")
+}
+
+func ephemeralIdentityClassOK(identityClass string) bool {
+	return identityClass == "ephemeral" || identityClass == "ethereal"
 }
 
 func ephemeralReusableCred(c ephemeralCred, sess, base, expectedHandle string) bool {
@@ -557,10 +580,10 @@ func ephemeralReusableCred(c ephemeralCred, sess, base, expectedHandle string) b
 	if sess == "" || c.Session != sess {
 		return false
 	}
-	if c.IdentityClass != "ethereal" {
+	if !ephemeralIdentityClassOK(c.IdentityClass) {
 		return false
 	}
-	return ephemeralEtherealHandleOK(c.Handle) &&
+	return ephemeralHandleOK(c.Handle) &&
 		ephemeralSecretRE.MatchString(c.AgentSecret) &&
 		ephemeralCredLive(c) &&
 		ephemeralSameBase(c, base)
@@ -582,32 +605,87 @@ func ephemeralReadCred(path string) (ephemeralCred, bool) {
 // follows the bind pointer; the reclaim path scans for a session-stamped cred
 // when the bind pointer is missing/stale (so a lost bind never orphans a handle)
 // and rebuilds the bind. Refreshes a near-expiry local hint to mirror the server.
-func ephemeralTryReuse(etherealDir, bindFile, sess, base string) (ephemeralCred, string, bool) {
+func ephemeralTryReuse(ephemeralDir, legacyEphemeralDir, bindFile, sess, base string, legacySecure bool) (ephemeralCred, string, bool) {
 	if handle, err := os.ReadFile(bindFile); err == nil {
 		h := strings.TrimSpace(string(handle))
-		if ephemeralEtherealHandleOK(h) {
-			credPath := filepath.Join(etherealDir, h+".json")
+		if ephemeralHandleOK(h) {
+			credPath := filepath.Join(ephemeralDir, h+".json")
 			if c, ok := ephemeralReadCred(credPath); ok && ephemeralReusableCred(c, sess, base, h) {
+				c = ephemeralNormalizeStoredCred(credPath, c)
 				ephemeralRefreshExpiry(credPath, c)
 				return c, credPath, true
+			}
+			if legacySecure {
+				if c, legacyPath, ok := ephemeralTryMigrateLegacyCred(legacyEphemeralDir, ephemeralDir, h, sess, base); ok {
+					ephemeralRefreshExpiry(legacyPath, c)
+					return c, legacyPath, true
+				}
 			}
 		}
 	}
 	// Reclaim: a cred stamped with this session, still live, but no usable bind.
-	matches, _ := filepath.Glob(filepath.Join(etherealDir, "*.json"))
+	matches, _ := filepath.Glob(filepath.Join(ephemeralDir, "*.json"))
 	for _, p := range matches {
 		c, ok := ephemeralReadCred(p)
 		expected := strings.TrimSuffix(filepath.Base(p), ".json")
 		if !ok || !ephemeralReusableCred(c, sess, base, expected) {
 			continue
 		}
+		c = ephemeralNormalizeStoredCred(p, c)
 		if err := commentbus.WritePrivateFileAtomic(bindFile, []byte(c.Handle), 0o600); err != nil {
 			continue // couldn't rebuild bind; don't claim reuse
 		}
 		ephemeralRefreshExpiry(p, c)
 		return c, p, true
 	}
+	if legacySecure {
+		legacyMatches, _ := filepath.Glob(filepath.Join(legacyEphemeralDir, "*.json"))
+		for _, p := range legacyMatches {
+			c, ok := ephemeralReadCred(p)
+			expected := strings.TrimSuffix(filepath.Base(p), ".json")
+			if !ok || !ephemeralReusableCred(c, sess, base, expected) {
+				continue
+			}
+			nextPath := filepath.Join(ephemeralDir, c.Handle+".json")
+			c.IdentityClass = "ephemeral"
+			data, err := json.Marshal(c)
+			if err != nil || commentbus.WritePrivateFileAtomic(nextPath, data, 0o600) != nil {
+				continue
+			}
+			if err := commentbus.WritePrivateFileAtomic(bindFile, []byte(c.Handle), 0o600); err != nil {
+				continue
+			}
+			ephemeralRefreshExpiry(nextPath, c)
+			return c, nextPath, true
+		}
+	}
 	return ephemeralCred{}, "", false
+}
+
+func ephemeralTryMigrateLegacyCred(legacyEphemeralDir, ephemeralDir, handle, sess, base string) (ephemeralCred, string, bool) {
+	legacyPath := filepath.Join(legacyEphemeralDir, handle+".json")
+	c, ok := ephemeralReadCred(legacyPath)
+	if !ok || !ephemeralReusableCred(c, sess, base, handle) {
+		return ephemeralCred{}, "", false
+	}
+	c.IdentityClass = "ephemeral"
+	nextPath := filepath.Join(ephemeralDir, handle+".json")
+	data, err := json.Marshal(c)
+	if err != nil || commentbus.WritePrivateFileAtomic(nextPath, data, 0o600) != nil {
+		return ephemeralCred{}, "", false
+	}
+	return c, nextPath, true
+}
+
+func ephemeralNormalizeStoredCred(path string, c ephemeralCred) ephemeralCred {
+	if c.IdentityClass != "ethereal" {
+		return c
+	}
+	c.IdentityClass = "ephemeral"
+	if data, err := json.Marshal(c); err == nil {
+		_ = commentbus.WritePrivateFileAtomic(path, data, 0o600)
+	}
+	return c
 }
 
 // ephemeralRefreshExpiry pushes a near-expiry local hint out, mirroring the
@@ -737,11 +815,11 @@ var ephemeralContainerMint = func(ctx context.Context, container, sess, name, ba
 // `docker exec` runs `comment ephemeral ensure` INSIDE the container (which mints
 // over its own daemon token, exactly like the native path), and only the
 // resulting short-lived ephemeral secret crosses back over stdout to the host
-// ethereal store. The daemon socket and pairing token never leave the container.
+// ephemeral store. The daemon socket and pairing token never leave the container.
 // The container is resolved deterministically from the origin (comment-agent-<slug>,
 // the same name the installer/uninstaller use). Returns ok=false (caller stays
 // anonymous) when docker is absent, the container isn't running, or the mint fails.
-func ephemeralTryDockerExecMint(sess, name, base, etherealDir, bindFile string) (ephemeralCred, string, bool) {
+func ephemeralTryDockerExecMint(sess, name, base, ephemeralDir, bindFile string) (ephemeralCred, string, bool) {
 	container := dockerAgentContainerName(dockerAgentSlug(base))
 	ctx, cancel := context.WithTimeout(context.Background(), ephemeralMintTimeout+15*time.Second)
 	defer cancel()
@@ -761,8 +839,8 @@ func ephemeralTryDockerExecMint(sess, name, base, etherealDir, bindFile string) 
 	}
 	// Validate before trusting: handle becomes a filename, secret a bearer token.
 	if !ephemeralSecretRE.MatchString(parsed.AgentSecret) ||
-		(parsed.IdentityClass != "" && parsed.IdentityClass != "ethereal") ||
-		!ephemeralEtherealHandleOK(parsed.Handle) {
+		(parsed.IdentityClass != "" && !ephemeralIdentityClassOK(parsed.IdentityClass)) ||
+		!ephemeralHandleOK(parsed.Handle) {
 		return ephemeralCred{}, "", false
 	}
 	// Reject a cred minted against a DIFFERENT origin than requested — a stale or
@@ -778,13 +856,13 @@ func ephemeralTryDockerExecMint(sess, name, base, etherealDir, bindFile string) 
 	c := ephemeralCred{
 		Handle:        parsed.Handle,
 		AgentSecret:   parsed.AgentSecret,
-		IdentityClass: "ethereal",
+		IdentityClass: "ephemeral",
 		DisplayName:   strings.TrimSpace(name),
 		BaseURL:       firstNonEmpty(strings.TrimSpace(parsed.BaseURL), base),
 		ExpiresAt:     strings.TrimSpace(parsed.ExpiresAt),
 		Session:       sess,
 	}
-	credPath := filepath.Join(etherealDir, c.Handle+".json")
+	credPath := filepath.Join(ephemeralDir, c.Handle+".json")
 	data, err := json.Marshal(c)
 	if err != nil {
 		return ephemeralCred{}, "", false
@@ -797,7 +875,7 @@ func ephemeralTryDockerExecMint(sess, name, base, etherealDir, bindFile string) 
 	return c, credPath, true
 }
 
-func ephemeralMint(base, ark, name, sess, etherealDir, bindFile string) (ephemeralCred, string, error) {
+func ephemeralMint(base, ark, name, sess, ephemeralDir, bindFile string) (ephemeralCred, string, error) {
 	body := map[string]any{}
 	if name != "" {
 		body["display_name"] = name
@@ -831,16 +909,16 @@ func ephemeralMint(base, ark, name, sess, etherealDir, bindFile string) (ephemer
 	}
 	// Validate shapes before trusting them: handle becomes a filename and the
 	// secret becomes an Authorization header value.
-	if !ephemeralSecretRE.MatchString(c.AgentSecret) || !ephemeralEtherealHandleOK(c.Handle) {
+	if !ephemeralSecretRE.MatchString(c.AgentSecret) || !ephemeralHandleOK(c.Handle) {
 		return ephemeralCred{}, "", errors.New("mint returned a malformed handle/secret")
 	}
-	c.IdentityClass = "ethereal"
+	c.IdentityClass = "ephemeral"
 	if c.BaseURL == "" {
 		c.BaseURL = base
 	}
 	c.Session = sess
 
-	credPath := filepath.Join(etherealDir, c.Handle+".json")
+	credPath := filepath.Join(ephemeralDir, c.Handle+".json")
 	data, err := json.Marshal(c)
 	if err != nil {
 		return ephemeralCred{}, "", err

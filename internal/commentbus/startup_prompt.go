@@ -132,6 +132,13 @@ func renderBotletsTmuxStartupInstruction(baseURL string, botName string, botDisp
 		b.WriteString("), a Botlets bot. Your brain is at ")
 	}
 	b.WriteString(paths.BrainRoot)
+	// The today/yesterday daily-note read mandate is deliberately NOT inlined
+	// here. This single-line tmux nudge is hard-capped at 512 bytes
+	// (validateStartupInstruction) with effectively no headroom on long brain
+	// roots, and it already directs the bot to read AGENTS.md, whose Session
+	// Startup section carries the main-session daily-notes mandate. The richer
+	// multi-line BuildBotletsSetupOrientation states it explicitly; this terse
+	// boot keystroke relies on AGENTS.md to avoid overflowing the chunk limit.
 	if compact {
 		b.WriteString(". Read AGENTS.md, TOOLS.md, SOUL.md, IDENTITY.md, USER.md, MEMORY.md, HEARTBEAT.md. Read llms before writes; patch by slug/revision; new brain docs: POST /docs library_target bot; never runtime memory.")
 	} else {

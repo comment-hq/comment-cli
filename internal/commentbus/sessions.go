@@ -286,26 +286,95 @@ func normalizeManagedSessionLaunchMode(mode string) string {
 
 func managedSessionRuntimeCommandForLaunch(runtime string, botName string, runtimeSessionRef string, launchMode string) []string {
 	launchMode = normalizeManagedSessionLaunchMode(launchMode)
+	// Botlets are NOT Claude subagents — their identity comes from the brain
+	// working dir + the session-exec env injection, not a `--agent` flag. Older
+	// `claude` silently ignored an unknown `--agent <bot>`; Claude Code >= 2.1.x
+	// hard-errors (`--agent '<bot>' not found`), killing the runtime ~1s after
+	// launch and driving the daemon into an infinite relaunch loop (issue #1420).
+	// We therefore never pass `--agent` to `claude`. botName is retained as a
+	// parameter for the codex/shape symmetry and existing call sites (it is no
+	// longer part of any Claude command).
 	if launchMode == managedSessionLaunchResume && runtimeSessionRef != "" && isRuntimeSessionRef(runtime, runtimeSessionRef) {
 		if runtime == "codex" {
 			return []string{"codex", "resume", runtimeSessionRef, "--yolo"}
 		}
-		return []string{"claude", "--resume", runtimeSessionRef, "--agent", botName, "--dangerously-skip-permissions"}
+		return []string{"claude", "--resume", runtimeSessionRef, "--dangerously-skip-permissions"}
 	}
 	if runtime == "codex" {
 		return []string{"codex", "--yolo"}
 	}
 	if runtimeSessionRef != "" {
-		return []string{"claude", "--session-id", runtimeSessionRef, "--agent", botName, "--dangerously-skip-permissions"}
+		return []string{"claude", "--session-id", runtimeSessionRef, "--dangerously-skip-permissions"}
 	}
-	return []string{"claude", "--agent", botName, "--dangerously-skip-permissions"}
+	return []string{"claude", "--dangerously-skip-permissions"}
+}
+
+func normalizeManagedSessionRuntimeCommand(record SessionRecord) []string {
+	if record.Runtime != "claude" || !managedSessionRuntimeCommandMatches(record) {
+		return append([]string(nil), record.RuntimeCommand...)
+	}
+	hasRef := record.RuntimeSessionRef != "" && isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef)
+	if hasRef && len(record.RuntimeCommand) == 6 &&
+		record.RuntimeCommand[0] == "claude" &&
+		record.RuntimeCommand[1] == "--session-id" &&
+		record.RuntimeCommand[2] == record.RuntimeSessionRef &&
+		record.RuntimeCommand[3] == "--agent" &&
+		record.RuntimeCommand[4] == record.BotName &&
+		record.RuntimeCommand[5] == "--dangerously-skip-permissions" {
+		return []string{"claude", "--session-id", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
+	}
+	if hasRef && len(record.RuntimeCommand) == 6 &&
+		record.RuntimeCommand[0] == "claude" &&
+		record.RuntimeCommand[1] == "--resume" &&
+		record.RuntimeCommand[2] == record.RuntimeSessionRef &&
+		record.RuntimeCommand[3] == "--agent" &&
+		record.RuntimeCommand[4] == record.BotName &&
+		record.RuntimeCommand[5] == "--dangerously-skip-permissions" {
+		return []string{"claude", "--resume", record.RuntimeSessionRef, "--dangerously-skip-permissions"}
+	}
+	if len(record.RuntimeCommand) == 4 &&
+		record.RuntimeCommand[0] == "claude" &&
+		record.RuntimeCommand[1] == "--agent" &&
+		record.RuntimeCommand[2] == record.BotName &&
+		record.RuntimeCommand[3] == "--dangerously-skip-permissions" {
+		return []string{"claude", "--dangerously-skip-permissions"}
+	}
+	if len(record.RuntimeCommand) == 3 &&
+		record.RuntimeCommand[0] == "claude" &&
+		record.RuntimeCommand[1] == "--agent" &&
+		record.RuntimeCommand[2] == record.BotName {
+		return []string{"claude"}
+	}
+	return append([]string(nil), record.RuntimeCommand...)
 }
 
 func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 	switch record.Runtime {
 	case "claude":
-		pinned := record.RuntimeSessionRef != "" &&
-			isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef) &&
+		hasRef := record.RuntimeSessionRef != "" && isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef)
+		// Current agentless shapes (issue #1420): `claude` no longer takes the
+		// unknown `--agent <bot>` flag, so the launch command is one pair shorter.
+		pinned := hasRef &&
+			len(record.RuntimeCommand) == 4 &&
+			record.RuntimeCommand[0] == "claude" &&
+			record.RuntimeCommand[1] == "--session-id" &&
+			record.RuntimeCommand[2] == record.RuntimeSessionRef &&
+			record.RuntimeCommand[3] == "--dangerously-skip-permissions"
+		resume := hasRef &&
+			len(record.RuntimeCommand) == 4 &&
+			record.RuntimeCommand[0] == "claude" &&
+			record.RuntimeCommand[1] == "--resume" &&
+			record.RuntimeCommand[2] == record.RuntimeSessionRef &&
+			record.RuntimeCommand[3] == "--dangerously-skip-permissions"
+		fresh := len(record.RuntimeCommand) == 2 &&
+			record.RuntimeCommand[0] == "claude" &&
+			record.RuntimeCommand[1] == "--dangerously-skip-permissions"
+		legacyAgentless := len(record.RuntimeCommand) == 1 &&
+			record.RuntimeCommand[0] == "claude"
+		// Legacy `--agent <bot>` shapes from records written before the fix. They
+		// stay accepted so existing records read cleanly (and don't poison the
+		// session read); the daemon regenerates them agentless on relaunch.
+		legacyPinned := hasRef &&
 			len(record.RuntimeCommand) == 6 &&
 			record.RuntimeCommand[0] == "claude" &&
 			record.RuntimeCommand[1] == "--session-id" &&
@@ -313,8 +382,7 @@ func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 			record.RuntimeCommand[3] == "--agent" &&
 			record.RuntimeCommand[4] == record.BotName &&
 			record.RuntimeCommand[5] == "--dangerously-skip-permissions"
-		resume := record.RuntimeSessionRef != "" &&
-			isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef) &&
+		legacyResume := hasRef &&
 			len(record.RuntimeCommand) == 6 &&
 			record.RuntimeCommand[0] == "claude" &&
 			record.RuntimeCommand[1] == "--resume" &&
@@ -322,7 +390,7 @@ func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 			record.RuntimeCommand[3] == "--agent" &&
 			record.RuntimeCommand[4] == record.BotName &&
 			record.RuntimeCommand[5] == "--dangerously-skip-permissions"
-		modern := len(record.RuntimeCommand) == 4 &&
+		legacyModern := len(record.RuntimeCommand) == 4 &&
 			record.RuntimeCommand[0] == "claude" &&
 			record.RuntimeCommand[1] == "--agent" &&
 			record.RuntimeCommand[2] == record.BotName &&
@@ -332,9 +400,9 @@ func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 			record.RuntimeCommand[1] == "--agent" &&
 			record.RuntimeCommand[2] == record.BotName
 		if normalizeSessionHost(record.Host) == SessionHostBmux {
-			return pinned || resume
+			return pinned || resume || legacyPinned || legacyResume
 		}
-		return pinned || resume || modern || legacy
+		return pinned || resume || fresh || legacyAgentless || legacyPinned || legacyResume || legacyModern || legacy
 	case "codex":
 		modern := len(record.RuntimeCommand) == 2 &&
 			record.RuntimeCommand[0] == "codex" &&
@@ -415,9 +483,16 @@ func ReadSessionRecord(paths Paths, sessionID string) (SessionRecord, error) {
 	if err := validateSessionRecord(paths, record); err != nil {
 		return SessionRecord{}, err
 	}
+	record.RuntimeCommand = normalizeManagedSessionRuntimeCommand(record)
 	return record, nil
 }
 
+// ListSessionRecords reads all session records strictly: a single malformed or
+// invalid record fails the whole read. This fail-closed behavior is relied on by
+// safety-sensitive callers like `comment uninstall`, which must NOT proceed to
+// delete state when it cannot positively account for every managed session.
+// Liveness/status read paths that must tolerate a poisoned record instead use
+// ListSessionRecordsLenient (see issue #1420 Bug 2).
 func ListSessionRecords(paths Paths) ([]SessionRecord, error) {
 	entries, err := os.ReadDir(paths.Sessions)
 	if errors.Is(err, os.ErrNotExist) {
@@ -441,6 +516,41 @@ func ListSessionRecords(paths Paths) ([]SessionRecord, error) {
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].SessionID < records[j].SessionID })
 	return records, nil
+}
+
+// ListSessionRecordsLenient reads every valid session record, skipping (rather
+// than failing the whole batch on) any individual record that is malformed or
+// fails validation. A single poisoned record must not abort the read: that
+// previously surfaced to clients as `UPSTREAM_ERROR: could not read sessions`
+// and took down `comment run` / `comment sessions status` whenever the relaunch
+// loop leaked a dangling record (issue #1420). The skipped session IDs are
+// returned so callers can log/quarantine them. Only a directory-level read
+// failure is fatal.
+func ListSessionRecordsLenient(paths Paths) ([]SessionRecord, []string, error) {
+	entries, err := os.ReadDir(paths.Sessions)
+	if errors.Is(err, os.ErrNotExist) {
+		return []SessionRecord{}, nil, nil
+	}
+	if err != nil {
+		return nil, nil, errors.New("could not read sessions")
+	}
+	var records []SessionRecord
+	var skipped []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".json" {
+			continue
+		}
+		sessionID := name[:len(name)-len(".json")]
+		record, err := ReadSessionRecord(paths, sessionID)
+		if err != nil {
+			skipped = append(skipped, sessionID)
+			continue
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].SessionID < records[j].SessionID })
+	return records, skipped, nil
 }
 
 func VerifySessionCapability(paths Paths, auth SocketAuth) (SessionRecord, error) {

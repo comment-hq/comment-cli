@@ -176,7 +176,7 @@ var cliHelpTopics = map[string]cliHelpTopic{
 			"comment bus run [--home ~/.comment-io] [--botlets-home ~/botlets] [--tmux-bin /path/to/tmux]",
 			"comment bus install [--home ~/.comment-io] [--botlets-home ~/botlets] [--bin /path/to/comment] [--dry-run]",
 			"comment bus start|stop|status|uninstall [--home ~/.comment-io]",
-			"comment bus pair [--home ~/.comment-io] [--label \"Max's MacBook\"] [--base-url https://comment.io] [--force]",
+			"comment bus pair [--home ~/.comment-io] [--label \"Max's MacBook\"] [--base-url https://comment.io] [--force] [--cli|--resume]",
 			"comment bus unpair [--home ~/.comment-io] [--yes]",
 			"comment bus reload-profiles [--home ~/.comment-io] [--botlets-home ~/botlets]",
 			"comment bus repair [--dry-run] [--message-id msg_...] [--op-id op_...] [--home ~/.comment-io]",
@@ -190,7 +190,7 @@ var cliHelpTopics = map[string]cliHelpTopic{
 			"On macOS, `install` uses launchd. On Linux, it uses systemd --user when available.",
 			"`health` reports daemon/store health. `status` reports persistent service status.",
 			"`reload-profiles` asks the daemon to re-read `~/.comment-io/agents/*.json`.",
-			"`pair` runs a browser-approved device flow and stores this computer's daemon credentials at `~/.comment-io/bus/daemon-auth.json` (0600). `pair --force` replaces the local pairing without revoking the previous daemon or deleting agent profiles; journaled profiles refresh through the new daemon. Revoke the previous computer in the web app after running sessions finish. `unpair` revokes this daemon server-side and, after confirmed revoke, cleans profiles installed by that daemon's enrollments.",
+			"`pair` runs a browser-approved device flow and stores this computer's daemon credentials at `~/.comment-io/bus/daemon-auth.json` (0600). In an agent/tool call, use `pair --cli` to print the approval URL/code and exit, then after the human approves run `pair --resume` to finish. `pair --force` replaces the local pairing without revoking the previous daemon or deleting agent profiles; journaled profiles refresh through the new daemon. Revoke the previous computer in the web app after running sessions finish. `unpair` revokes this daemon server-side and, after confirmed revoke, cleans profiles installed by that daemon's enrollments.",
 		},
 		Examples: []string{
 			"comment bus install --bin \"$(command -v comment)\"",

@@ -3129,7 +3129,7 @@ func TestBotletsSetupRunCommandUsesSupportedShortcut(t *testing.T) {
 	if got := botletsSetupRunCommand("reviewer"); got != "comment run reviewer" {
 		t.Fatalf("setup run command = %q", got)
 	}
-	if got := botletsShortcutRuntimeArgs("claude", "reviewer"); !slices.Equal(got, []string{"--agent", "reviewer", "--dangerously-skip-permissions"}) {
+	if got := botletsShortcutRuntimeArgs("claude", "reviewer"); !slices.Equal(got, []string{"--dangerously-skip-permissions"}) {
 		t.Fatalf("claude shortcut runtime args = %#v", got)
 	}
 	if got := botletsShortcutRuntimeArgs("codex", "reviewer"); !slices.Equal(got, []string{"--yolo"}) {
@@ -3409,7 +3409,7 @@ func TestRunRuntimeBotletsShortcutUsesSavedRuntime(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("session records = %#v", records)
 	}
-	wantCommand := []string{"claude", "--agent", "reviewer", "--dangerously-skip-permissions"}
+	wantCommand := []string{"claude", "--dangerously-skip-permissions"}
 	if !slices.Equal(records[0].RuntimeCommand, wantCommand) {
 		t.Fatalf("runtime command = %#v, want %#v", records[0].RuntimeCommand, wantCommand)
 	}

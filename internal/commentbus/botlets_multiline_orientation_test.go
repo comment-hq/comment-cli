@@ -88,6 +88,7 @@ func TestSendBotletsMultilineOrientationPastesRichOrientation(t *testing.T) {
 		"`USER.md`",
 		"`MEMORY.md`",
 		"`HEARTBEAT.md`",
+		"Also read today's and yesterday's daily notes",
 		"Before editing, archiving, or remembering anything in the brain, load the Comment.io API instructions now.",
 		"Brain files under the local sync root are read-only projections",
 		"Do not use Claude Code/Codex built-in memory",
