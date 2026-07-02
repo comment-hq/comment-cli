@@ -185,6 +185,7 @@ type agentEnrollmentRedeemResponse struct {
 // projection, so the server omits it.
 type agentEnrollmentBotletsHint struct {
 	Runtime string `json:"runtime"`
+	Model   string `json:"model"`
 	// ScheduleTimezone is the bot's configured schedule timezone, mirrored into
 	// the local registry entry's managed-session setting so daily session
 	// resets follow the bot's timezone (same as `botlets register --timezone`).
@@ -896,6 +897,7 @@ func (w *agentEnrollmentWorker) installBotletsEnrollment(ctx context.Context, au
 		ScheduleTimezone:   strings.TrimSpace(hint.ScheduleTimezone),
 		RespondsToMentions: hint.RespondsToMentions,
 		Runtime:            runtime,
+		Model:              strings.TrimSpace(hint.Model),
 	})
 	if err != nil {
 		// Local Botlets wiring failed after the credential was minted (brain

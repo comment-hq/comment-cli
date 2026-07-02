@@ -48,7 +48,7 @@ var (
 	runtimeRequestHTTPClient = &http.Client{Timeout: runtimeRequestRequestTimeout}
 	// runtimeRequestLaunch starts the agent's runtime detached and returns nil on
 	// success or an error describing the failure. Stubbed in tests.
-	runtimeRequestLaunch = launchAgentRuntimeDetached
+	runtimeRequestLaunch = launchAgentRuntimeRequestDetached
 )
 
 func startAgentRuntimeRequestWorker(ctx context.Context, paths commentbus.Paths) {
@@ -89,6 +89,7 @@ type agentRuntimeRequestListItem struct {
 	AgentID   string `json:"agent_id"`
 	Handle    string `json:"handle"`
 	DaemonID  string `json:"daemon_id"`
+	Model     string `json:"model"`
 }
 
 func (w *agentRuntimeRequestWorker) runOnce(ctx context.Context) time.Duration {
@@ -218,7 +219,7 @@ func (w *agentRuntimeRequestWorker) processRequest(ctx context.Context, auth com
 		// Already started on a previous pass; only the ack failed. Retry the ack.
 	} else {
 		w.logInfo("agent_runtime_request.launching", map[string]any{"request_id": item.RequestID, "handle": item.Handle})
-		if launchErr := runtimeRequestLaunch(ctx, w.paths, item.Handle); launchErr != nil {
+		if launchErr := runtimeRequestLaunch(ctx, w.paths, item.Handle, item.Model); launchErr != nil {
 			state = "failed"
 			failureMessage = launchErr.Error()
 			w.logWarn("agent_runtime_request.launch_failed", map[string]any{"request_id": item.RequestID, "handle": item.Handle, "error": failureMessage})
@@ -282,15 +283,30 @@ func (w *agentRuntimeRequestWorker) postRuntimeRequestAck(ctx context.Context, a
 // SAME home/profiles/socket the daemon holds — even when the daemon was started
 // as `comment bus run --home /custom` (a custom home set by flag, not via the
 // COMMENT_IO_HOME env var the bare process inherits).
-func launchAgentRuntimeDetached(ctx context.Context, paths commentbus.Paths, handle string) error {
+func launchAgentRuntimeRequestDetached(ctx context.Context, paths commentbus.Paths, handle string, model string) error {
+	return launchAgentRuntimeDetachedWithModelIntent(ctx, paths, handle, model, true)
+}
+
+func launchAgentRuntimeDetached(ctx context.Context, paths commentbus.Paths, handle string, model string) error {
+	return launchAgentRuntimeDetachedWithModelIntent(ctx, paths, handle, model, false)
+}
+
+func launchAgentRuntimeDetachedWithModelIntent(ctx context.Context, paths commentbus.Paths, handle string, model string, explicitModel bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("could not resolve the comment binary: %w", err)
 	}
 	launchCtx, cancel := context.WithTimeout(ctx, runtimeRequestLaunchTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(launchCtx, exe, "run", handle)
+	args := []string{"run", handle}
+	if model = strings.TrimSpace(model); model != "" {
+		args = append(args, "--model", model)
+	}
+	cmd := exec.CommandContext(launchCtx, exe, args...)
 	cmd.Env = agentRuntimeLaunchEnv(paths)
+	if explicitModel {
+		cmd.Env = withRuntimeRequestModelEnv(cmd.Env, model)
+	}
 	cmd.Stdin = nil
 	var out strings.Builder
 	cmd.Stdout = &out
@@ -306,6 +322,22 @@ func launchAgentRuntimeDetached(ctx context.Context, paths commentbus.Paths, han
 		return errors.New(msg)
 	}
 	return nil
+}
+
+func withRuntimeRequestModelEnv(env []string, model string) []string {
+	out := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		key := entry
+		if idx := strings.IndexRune(entry, '='); idx >= 0 {
+			key = entry[:idx]
+		}
+		if key == runtimeRequestModelExplicitEnv || key == runtimeRequestModelEnv {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out, runtimeRequestModelExplicitEnv+"=1", runtimeRequestModelEnv+"="+strings.TrimSpace(model))
+	return out
 }
 
 // agentRuntimeLaunchEnv builds the environment for the detached `comment run`.
@@ -347,6 +379,9 @@ func agentRuntimeLaunchEnv(paths commentbus.Paths) []string {
 			key = entry[:idx]
 		}
 		if key == "COMMENT_IO_SKIP_ATTACH" {
+			continue
+		}
+		if key == runtimeRequestModelExplicitEnv || key == runtimeRequestModelEnv {
 			continue
 		}
 		// Drop any inherited COMMENT_IO_HOME so the daemon's resolved home (set

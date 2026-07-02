@@ -132,7 +132,7 @@ func maybeDelegateRuntimeToDocker(ctx context.Context, paths commentbus.Paths, o
 	if attach && (!dockerRuntimeStdinIsTerminal() || !dockerRuntimeStdoutIsTerminal()) {
 		return true, errors.New("Docker agent runtime attach needs an interactive terminal; rerun in a terminal or pass --detach")
 	}
-	return true, execDockerRuntimeCommand(ctx, dockerBin, target.Container, attach, dockerRuntimeDelegatedArgv(options))
+	return true, execDockerRuntimeCommand(ctx, dockerBin, target.Container, attach, options, dockerRuntimeDelegatedArgv(options))
 }
 
 func hostDaemonUnavailableForDockerRuntime(ctx context.Context, paths commentbus.Paths) bool {
@@ -454,12 +454,17 @@ func dockerRuntimeContainerBaseURL(ctx context.Context, dockerBin string, contai
 	return base, nil
 }
 
-func execDockerRuntimeCommand(ctx context.Context, dockerBin string, container string, attach bool, delegated []string) error {
+func execDockerRuntimeCommand(ctx context.Context, dockerBin string, container string, attach bool, options runtimeRunOptions, delegated []string) error {
 	args := []string{"exec"}
 	if attach {
 		args = append(args, "-it")
 	}
 	args = append(args, "-e", dockerRuntimeSandboxEnv+"=1")
+	if options.ModelSet {
+		for _, entry := range withRuntimeRequestModelEnv(nil, options.Model) {
+			args = append(args, "-e", entry)
+		}
+	}
 	if os.Getenv("COMMENT_IO_SKIP_ATTACH") == "1" {
 		args = append(args, "-e", "COMMENT_IO_SKIP_ATTACH=1")
 	}
@@ -486,6 +491,9 @@ func dockerRuntimeDelegatedArgv(options runtimeRunOptions) []string {
 	}
 	if options.Profile != "" {
 		args = append(args, "--profile", options.Profile)
+	}
+	if options.Model != "" {
+		args = append(args, "--model", options.Model)
 	}
 	if options.Role != "" && options.Role != commentbus.RuntimeRoleMain {
 		args = append(args, "--role", options.Role)

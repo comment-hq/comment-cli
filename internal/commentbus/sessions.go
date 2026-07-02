@@ -32,6 +32,7 @@ type SessionRecord struct {
 	Generation         string   `json:"generation"`
 	CapabilityFile     string   `json:"capability_file"`
 	Runtime            string   `json:"runtime"`
+	Model              string   `json:"model,omitempty"`
 	RuntimePath        string   `json:"runtime_path,omitempty"`
 	RuntimeSessionRef  string   `json:"runtime_session_ref,omitempty"`
 	RuntimeCommandPath string   `json:"runtime_command_path,omitempty"`
@@ -89,6 +90,7 @@ type RegisterSessionOptions struct {
 	SessionName       string
 	PaneTarget        string
 	Runtime           string
+	Model             string
 	RuntimeSessionRef string
 	LaunchMode        string
 	State             string
@@ -131,6 +133,10 @@ func RegisterSession(options RegisterSessionOptions) (SessionRecord, error) {
 		options.Runtime = "claude"
 	}
 	if !isManagedSessionRuntime(options.Runtime) {
+		return SessionRecord{}, ErrInvalidSession
+	}
+	model, ok := normalizeAgentModel(options.Model)
+	if !ok {
 		return SessionRecord{}, ErrInvalidSession
 	}
 	host := normalizeSessionHost(options.Host)
@@ -212,8 +218,9 @@ func RegisterSession(options RegisterSessionOptions) (SessionRecord, error) {
 		Generation:        generation,
 		CapabilityFile:    capabilityFile,
 		Runtime:           options.Runtime,
+		Model:             model,
 		RuntimeSessionRef: runtimeSessionRef,
-		RuntimeCommand:    managedSessionRuntimeCommandForLaunch(options.Runtime, options.BotName, runtimeSessionRef, launchMode),
+		RuntimeCommand:    managedSessionRuntimeCommandForLaunch(options.Runtime, options.BotName, runtimeSessionRef, launchMode, model),
 		// New managed sessions resolve the runtime through the user's login
 		// shell (supports PATH binaries, aliases, functions); no trusted-binary
 		// path is pinned. Legacy records without this field coerce to "path".
@@ -285,8 +292,12 @@ func normalizeManagedSessionLaunchMode(mode string) string {
 	return managedSessionLaunchFresh
 }
 
-func managedSessionRuntimeCommandForLaunch(runtime string, botName string, runtimeSessionRef string, launchMode string) []string {
+func managedSessionRuntimeCommandForLaunch(runtime string, botName string, runtimeSessionRef string, launchMode string, modelOpt ...string) []string {
 	launchMode = normalizeManagedSessionLaunchMode(launchMode)
+	model := ""
+	if len(modelOpt) > 0 {
+		model, _ = normalizeAgentModel(modelOpt[0])
+	}
 	// Botlets are NOT Claude subagents — their identity comes from the brain
 	// working dir + the session-exec env injection, not a `--agent` flag. Older
 	// `claude` silently ignored an unknown `--agent <bot>`; Claude Code >= 2.1.x
@@ -297,15 +308,30 @@ func managedSessionRuntimeCommandForLaunch(runtime string, botName string, runti
 	// longer part of any Claude command).
 	if launchMode == managedSessionLaunchResume && runtimeSessionRef != "" && isRuntimeSessionRef(runtime, runtimeSessionRef) {
 		if runtime == "codex" {
+			if model != "" {
+				return []string{"codex", "resume", runtimeSessionRef, "--model", model, "--yolo"}
+			}
 			return []string{"codex", "resume", runtimeSessionRef, "--yolo"}
+		}
+		if model != "" {
+			return []string{"claude", "--resume", runtimeSessionRef, "--model", model, "--dangerously-skip-permissions"}
 		}
 		return []string{"claude", "--resume", runtimeSessionRef, "--dangerously-skip-permissions"}
 	}
 	if runtime == "codex" {
+		if model != "" {
+			return []string{"codex", "--model", model, "--yolo"}
+		}
 		return []string{"codex", "--yolo"}
 	}
 	if runtimeSessionRef != "" {
+		if model != "" {
+			return []string{"claude", "--session-id", runtimeSessionRef, "--model", model, "--dangerously-skip-permissions"}
+		}
 		return []string{"claude", "--session-id", runtimeSessionRef, "--dangerously-skip-permissions"}
+	}
+	if model != "" {
+		return []string{"claude", "--model", model, "--dangerously-skip-permissions"}
 	}
 	return []string{"claude", "--dangerously-skip-permissions"}
 }
@@ -349,10 +375,40 @@ func normalizeManagedSessionRuntimeCommand(record SessionRecord) []string {
 	return append([]string(nil), record.RuntimeCommand...)
 }
 
+func stringSlicesEqual(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 	switch record.Runtime {
 	case "claude":
 		hasRef := record.RuntimeSessionRef != "" && isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef)
+		if record.Model != "" {
+			pinned := hasRef && stringSlicesEqual(
+				record.RuntimeCommand,
+				managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, managedSessionLaunchFresh, record.Model),
+			)
+			resume := hasRef && stringSlicesEqual(
+				record.RuntimeCommand,
+				managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, managedSessionLaunchResume, record.Model),
+			)
+			fresh := stringSlicesEqual(
+				record.RuntimeCommand,
+				managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, "", managedSessionLaunchFresh, record.Model),
+			)
+			if normalizeSessionHost(record.Host) == SessionHostBmux {
+				return pinned || resume
+			}
+			return pinned || resume || fresh
+		}
 		// Current agentless shapes (issue #1420): `claude` no longer takes the
 		// unknown `--agent <bot>` flag, so the launch command is one pair shorter.
 		pinned := hasRef &&
@@ -405,6 +461,19 @@ func managedSessionRuntimeCommandMatches(record SessionRecord) bool {
 		}
 		return pinned || resume || fresh || legacyAgentless || legacyPinned || legacyResume || legacyModern || legacy
 	case "codex":
+		if record.Model != "" {
+			modern := stringSlicesEqual(
+				record.RuntimeCommand,
+				managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, "", managedSessionLaunchFresh, record.Model),
+			)
+			resume := record.RuntimeSessionRef != "" &&
+				isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef) &&
+				stringSlicesEqual(
+					record.RuntimeCommand,
+					managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, managedSessionLaunchResume, record.Model),
+				)
+			return modern || resume
+		}
 		modern := len(record.RuntimeCommand) == 2 &&
 			record.RuntimeCommand[0] == "codex" &&
 			record.RuntimeCommand[1] == "--yolo"
@@ -621,6 +690,10 @@ func validateSessionRecord(paths Paths, record SessionRecord) error {
 		return errors.New("invalid session record")
 	}
 	if record.RuntimeSessionRef != "" && !isRuntimeSessionRef(record.Runtime, record.RuntimeSessionRef) {
+		return errors.New("invalid session record")
+	}
+	model, ok := normalizeAgentModel(record.Model)
+	if !ok || model != record.Model {
 		return errors.New("invalid session record")
 	}
 	if record.Host == SessionHostBmux && record.Runtime == "claude" && record.RuntimeSessionRef == "" {

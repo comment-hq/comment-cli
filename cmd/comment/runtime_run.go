@@ -24,6 +24,8 @@ type runtimeRunOptions struct {
 	RuntimePath    string // client-resolved absolute path; sent to daemon for execution
 	Profile        string
 	BotShortcut    string
+	Model          string
+	ModelSet       bool
 	Role           string
 	CWD            string
 	SetupAttemptID string
@@ -47,8 +49,14 @@ type managedSessionStartResult struct {
 	Found  bool
 }
 
+const (
+	runtimeRequestModelExplicitEnv = "COMMENT_IO_RUNTIME_REQUEST_MODEL_EXPLICIT"
+	runtimeRequestModelEnv         = "COMMENT_IO_RUNTIME_REQUEST_MODEL"
+)
+
 type configuredManagedRuntime struct {
 	Runtime          string
+	Model            string
 	AllowLegacyRetry bool
 }
 
@@ -183,6 +191,7 @@ func runRuntimeControl(args []string) error {
 func parseRuntimeRunArgs(args []string) (runtimeRunOptions, error) {
 	options := runtimeRunOptions{}
 	passThrough := make([]string, 0, len(args))
+	modelFlagProvided := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -222,7 +231,15 @@ func parseRuntimeRunArgs(args []string) (runtimeRunOptions, error) {
 			options.Role = value
 		case "setup-attempt-id":
 			options.SetupAttemptID = strings.TrimSpace(value)
+		case "model":
+			options.Model = strings.TrimSpace(value)
+			options.ModelSet = true
+			modelFlagProvided = true
 		}
+	}
+	if os.Getenv(runtimeRequestModelExplicitEnv) == "1" && !options.ModelSet {
+		options.Model = strings.TrimSpace(os.Getenv(runtimeRequestModelEnv))
+		options.ModelSet = true
 	}
 	if options.Runtime == "" && options.Profile == "" && len(passThrough) == 1 && !strings.HasPrefix(passThrough[0], "-") {
 		options.BotShortcut = strings.TrimPrefix(passThrough[0], "@")
@@ -250,6 +267,16 @@ func parseRuntimeRunArgs(args []string) (runtimeRunOptions, error) {
 	if options.SetupAttemptID != "" && !botletsSetupAttemptIDRE.MatchString(options.SetupAttemptID) {
 		return runtimeRunOptions{}, errors.New("invalid setup attempt id")
 	}
+	if modelFlagProvided && options.Model == "" {
+		return runtimeRunOptions{}, errors.New("invalid model")
+	}
+	if options.ModelSet {
+		model, ok := commentbus.NormalizeAgentModel(options.Model)
+		if !ok || (options.Model != "" && model == "") {
+			return runtimeRunOptions{}, errors.New("invalid model")
+		}
+		options.Model = model
+	}
 	if options.BotShortcut != "" && options.Role != commentbus.RuntimeRoleMain && !commentbus.ProfileRE.MatchString(options.BotShortcut) {
 		return runtimeRunOptions{}, errors.New("comment run <bot> only starts the main Botlets session")
 	}
@@ -258,7 +285,7 @@ func parseRuntimeRunArgs(args []string) (runtimeRunOptions, error) {
 
 func isRuntimeRunValueFlag(name string) bool {
 	switch name {
-	case "home", "runtime", "profile", "cwd", "role", "setup-attempt-id":
+	case "home", "runtime", "profile", "cwd", "role", "setup-attempt-id", "model":
 		return true
 	default:
 		return false
@@ -475,6 +502,8 @@ func defaultRunRuntimeCommand(options runtimeRunOptions) (err error) {
 	var startResult runtimeStartResult
 	if options.Role == "" || options.Role == commentbus.RuntimeRoleMain {
 		expectedManagedRuntime := requestedManagedRuntimeName(options.Runtime)
+		expectedManagedModel := options.Model
+		requestedManagedModelSet := options.ModelSet
 		allowManagedStartLegacyRetry := false
 		if configured, ok := configuredManagedSessionRuntime(paths, options.Profile); ok {
 			selectedRuntime, err := validateRequestedManagedRuntime(options.Profile, configured.Runtime, options.Runtime)
@@ -482,9 +511,12 @@ func defaultRunRuntimeCommand(options runtimeRunOptions) (err error) {
 				return err
 			}
 			expectedManagedRuntime = selectedRuntime
+			if !requestedManagedModelSet && expectedManagedModel == "" {
+				expectedManagedModel = configured.Model
+			}
 			allowManagedStartLegacyRetry = configured.AllowLegacyRetry
 		}
-		managedResult, err := startManagedSessionViaDaemon(context.Background(), paths, options.Profile, expectedManagedRuntime, allowManagedStartLegacyRetry)
+		managedResult, err := startManagedSessionViaDaemon(context.Background(), paths, options.Profile, expectedManagedRuntime, expectedManagedModel, requestedManagedModelSet, allowManagedStartLegacyRetry)
 		if err != nil {
 			if isDaemonUnavailableError(err) {
 				return errors.New("comment bus daemon is not running; run `comment bus install` or `comment bus start` first")
@@ -891,12 +923,21 @@ func readRuntimeExitOutputTail(path string, maxBytes int64) ([]byte, bool) {
 	return data, true
 }
 
+func runtimeArgsWithModel(options runtimeRunOptions) []string {
+	if options.Model != "" {
+		args := []string{"--model", options.Model}
+		return append(args, options.RuntimeArgs...)
+	}
+	return append([]string(nil), options.RuntimeArgs...)
+}
+
 func startRuntimeViaDaemon(ctx context.Context, paths commentbus.Paths, options runtimeRunOptions, cwd string) (runtimeStartResult, error) {
 	auth, err := ownerOnlyAuth(paths, options.Profile)
 	if err != nil {
 		return runtimeStartResult{}, err
 	}
-	command := append([]string{options.Runtime}, options.RuntimeArgs...)
+	runtimeArgs := runtimeArgsWithModel(options)
+	command := append([]string{options.Runtime}, runtimeArgs...)
 
 	// Preferred path: send the original user-typed identifier in
 	// `runtime_command[0]` and the client-resolved absolute path in the
@@ -925,7 +966,7 @@ func startRuntimeViaDaemon(ctx context.Context, paths commentbus.Paths, options 
 	// absolute path baked into `runtime_command[0]` so the old daemon
 	// can resolve and validate it directly.
 	if options.RuntimePath != "" && shouldRetryWithoutRuntimePath(response) {
-		legacyCommand := append([]string{options.RuntimePath}, options.RuntimeArgs...)
+		legacyCommand := append([]string{options.RuntimePath}, runtimeArgs...)
 		legacyParams := map[string]any{
 			"profile":         options.Profile,
 			"cwd":             cwd,
@@ -959,7 +1000,7 @@ func startRuntimeViaDaemon(ctx context.Context, paths commentbus.Paths, options 
 	return runtimeStartResult{Record: decoded.Runtime, Existing: decoded.Existing}, nil
 }
 
-func startManagedSessionViaDaemon(ctx context.Context, paths commentbus.Paths, profile string, expectedRuntime string, allowLegacyRetry bool) (managedSessionStartResult, error) {
+func startManagedSessionViaDaemon(ctx context.Context, paths commentbus.Paths, profile string, expectedRuntime string, model string, modelSet bool, allowLegacyRetry bool) (managedSessionStartResult, error) {
 	auth, err := ownerOnlyAuth(paths, profile)
 	if err != nil {
 		return managedSessionStartResult{}, err
@@ -968,11 +1009,20 @@ func startManagedSessionViaDaemon(ctx context.Context, paths commentbus.Paths, p
 	if expectedRuntime != "" {
 		params["expected_runtime"] = expectedRuntime
 	}
+	if modelSet {
+		params["requested_model"] = model
+		params["requested_model_set"] = true
+	} else if model != "" {
+		params["expected_model"] = model
+	}
 	response, err := callSocket(ctx, paths, "sessions.start", auth, params, managedSessionStartWait)
 	if err != nil {
 		return managedSessionStartResult{}, err
 	}
-	if expectedRuntime != "" && shouldRetryManagedStartWithoutExpectedRuntime(response) {
+	if (expectedRuntime != "" || model != "" || modelSet) && shouldRetryManagedStartWithoutExpectedRuntime(response) {
+		if err := managedStartLegacyModelRetryError(response, model, modelSet); err != nil {
+			return managedSessionStartResult{}, err
+		}
 		if !allowLegacyRetry {
 			return managedSessionStartResult{}, nil
 		}
@@ -1042,6 +1092,7 @@ func configuredManagedSessionRuntime(paths commentbus.Paths, profile string) (co
 			}
 			return configuredManagedRuntime{
 				Runtime:          entry.ManagedSession.Runtime,
+				Model:            entry.ManagedSession.Model,
 				AllowLegacyRetry: shouldAllowManagedStartLegacyRetry(profileRuntime, entry.RegistryRuntime),
 			}, true
 		}
@@ -1070,6 +1121,13 @@ func shouldRetryManagedStartWithoutExpectedRuntime(response commentbus.SocketRes
 		return false
 	}
 	return strings.Contains(strings.ToLower(response.Error.Message), "unexpected param")
+}
+
+func managedStartLegacyModelRetryError(response commentbus.SocketResponse, model string, modelSet bool) error {
+	if !shouldRetryManagedStartWithoutExpectedRuntime(response) || (model == "" && !modelSet) {
+		return nil
+	}
+	return errors.New("comment bus daemon is too old for managed-session model preferences; run `comment bus install` or restart the daemon, then try again")
 }
 
 func shouldFallbackToTransientRuntime(response commentbus.SocketResponse) bool {

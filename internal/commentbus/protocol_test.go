@@ -115,6 +115,30 @@ func TestValidateSocketRequest(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := ValidateSocketRequest(SocketRequest{
+		ID:   "req_sessionstartrequestedmodel",
+		Op:   "sessions.start",
+		Auth: auth,
+		Params: map[string]any{
+			"bot":                 "reviewer",
+			"requested_model":     "opus",
+			"requested_model_set": true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSocketRequest(SocketRequest{
+		ID:   "req_sessionstartrequestedemptymodel",
+		Op:   "sessions.start",
+		Auth: auth,
+		Params: map[string]any{
+			"bot":                 "reviewer",
+			"requested_model":     "",
+			"requested_model_set": true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestValidateSocketRequestAcceptsRepairDryRunFalse(t *testing.T) {
@@ -322,6 +346,20 @@ func TestValidateSocketRequestRejectsUnsafeParams(t *testing.T) {
 			"bot":        "reviewer",
 			"scope_type": "profile",
 			"scope_id":   "max.reviewer",
+		}},
+		{ID: "req_badstartrequestedmodelnoset", Op: "sessions.start", Auth: auth, Params: map[string]any{
+			"bot":             "reviewer",
+			"requested_model": "opus",
+		}},
+		{ID: "req_badstartrequestedmodelfalseset", Op: "sessions.start", Auth: auth, Params: map[string]any{
+			"bot":                 "reviewer",
+			"requested_model":     "opus",
+			"requested_model_set": false,
+		}},
+		{ID: "req_badstartrequestedmodeluntrimmed", Op: "sessions.start", Auth: auth, Params: map[string]any{
+			"bot":                 "reviewer",
+			"requested_model":     " opus ",
+			"requested_model_set": true,
 		}},
 		{ID: "req_badstopnoselector", Op: "sessions.stop", Auth: auth, Params: map[string]any{}},
 		{ID: "req_badnudgenoselector", Op: "sessions.nudge", Auth: auth, Params: map[string]any{

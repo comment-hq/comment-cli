@@ -117,6 +117,7 @@ type ownedAgentsManifestAgent struct {
 	Handle      string `json:"handle"`
 	DisplayName string `json:"display_name"`
 	Runtime     string `json:"runtime"`
+	Model       string `json:"model"`
 	// ScheduleTimezone is the managed-session reset timezone the server wants
 	// this (Botlets) bot installed with. A change must re-enroll so the local
 	// registry's timezone converges (cf carries it as schedule_timezone; null
@@ -380,7 +381,7 @@ func (w *ownedAgentsReconciler) agentLocallyInstalled(agent ownedAgentsManifestA
 		// runtime. An unreadable profile is indeterminate, not a mismatch —
 		// treat it as installed so a transient read error does not churn a
 		// re-enroll over a working install.
-		installedRuntime, ok := agentProfileRuntime(agentProfileFilePath(w.paths, handle))
+		installedRuntime, installedModel, ok := agentProfileRuntimeAndModel(agentProfileFilePath(w.paths, handle))
 		if !ok {
 			return true
 		}
@@ -394,7 +395,12 @@ func (w *ownedAgentsReconciler) agentLocallyInstalled(agent ownedAgentsManifestA
 		// missing, and rewrite it to the Claude fallback (PrepareAgentProfileWrite
 		// omits the runtime field on a runtime-less self-enroll).
 		if desired := strings.TrimSpace(agent.Runtime); desired != "" {
-			return normalizeAgentRuntime(installedRuntime) == normalizeAgentRuntime(desired)
+			if normalizeAgentRuntime(installedRuntime) != normalizeAgentRuntime(desired) {
+				return false
+			}
+		}
+		if desired := strings.TrimSpace(agent.Model); desired != "" {
+			return strings.TrimSpace(installedModel) == desired
 		}
 		return true
 	}
@@ -414,6 +420,9 @@ func (w *ownedAgentsReconciler) agentLocallyInstalled(agent ownedAgentsManifestA
 		return false
 	}
 	if normalizeAgentRuntime(entry.Runtime) != normalizeAgentRuntime(agent.Runtime) {
+		return false
+	}
+	if strings.TrimSpace(entry.Model) != strings.TrimSpace(agent.Model) {
 		return false
 	}
 	if strings.TrimSpace(entry.Timezone) != strings.TrimSpace(agent.ScheduleTimezone) {
@@ -502,6 +511,9 @@ func (w *ownedAgentsReconciler) selfEnroll(ctx context.Context, auth commentbus.
 		// agent and the installed profile silently falls back to Claude.
 		// Servers that do not yet accept the field ignore unknown JSON keys.
 		payload["runtime"] = runtime
+	}
+	if model := strings.TrimSpace(agent.Model); model != "" {
+		payload["model"] = model
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

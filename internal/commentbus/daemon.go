@@ -2504,8 +2504,15 @@ func (d *Daemon) startSession(req SocketRequest) (SessionRecord, *SocketError) {
 	if botErr != nil {
 		return SessionRecord{}, botErr
 	}
+	if requestedModelSet, _ := req.Params["requested_model_set"].(bool); requestedModelSet {
+		requestedModel, _ := req.Params["requested_model"].(string)
+		bot.ManagedSession.Model = requestedModel
+	}
 	if expectedRuntime, _ := req.Params["expected_runtime"].(string); expectedRuntime != "" && bot.ManagedSession.Runtime != expectedRuntime {
 		return SessionRecord{}, socketError("CONFLICT", "managed session for "+authority.Profile+" uses runtime "+strconv.Quote(bot.ManagedSession.Runtime), false)
+	}
+	if expectedModel, _ := req.Params["expected_model"].(string); expectedModel != "" && bot.ManagedSession.Model != expectedModel {
+		return SessionRecord{}, socketError("CONFLICT", "managed session for "+authority.Profile+" uses model "+strconv.Quote(bot.ManagedSession.Model), false)
 	}
 	d.sessionMu.Lock()
 	defer d.sessionMu.Unlock()
@@ -2515,7 +2522,7 @@ func (d *Daemon) startSession(req SocketRequest) (SessionRecord, *SocketError) {
 		Auth:   req.Auth,
 		Params: req.Params,
 	})
-	existing, ok, hadStale, staleReleasedMessages, existingErr := d.reconcileLiveSessionForScopeLocked(authority.Profile, authority.BotName, bot.BotID, botAgentID(bot), scopeType, scopeID)
+	existing, ok, hadStale, staleReleasedMessages, existingErr := d.reconcileLiveSessionForScopeLocked(authority.Profile, authority.BotName, bot.BotID, botAgentID(bot), scopeType, scopeID, bot.ManagedSession.Runtime, bot.ManagedSession.Model)
 	if existingErr != nil {
 		return SessionRecord{}, existingErr
 	}
@@ -2600,6 +2607,7 @@ func (d *Daemon) createAndLaunchSessionLockedWithContext(ctx context.Context, pr
 		BotletsHome: botletsHome,
 		SessionName: sessionName,
 		Runtime:     bot.ManagedSession.Runtime,
+		Model:       bot.ManagedSession.Model,
 		State:       "starting",
 		Now:         d.currentTime(),
 	})
@@ -2849,7 +2857,7 @@ func (d *Daemon) aliveSessionForScopeLocked(profile string, botName string, scop
 	return SessionRecord{}, false, nil
 }
 
-func (d *Daemon) reconcileLiveSessionForScopeLocked(profile string, botName string, botID string, botAgentID string, scopeType string, scopeID string) (SessionRecord, bool, bool, []string, *SocketError) {
+func (d *Daemon) reconcileLiveSessionForScopeLocked(profile string, botName string, botID string, botAgentID string, scopeType string, scopeID string, expectedRuntime string, expectedModel string) (SessionRecord, bool, bool, []string, *SocketError) {
 	records, err := d.listSessionRecords()
 	if err != nil {
 		return SessionRecord{}, false, false, nil, socketError("UPSTREAM_ERROR", "could not read sessions", false)
@@ -2878,6 +2886,15 @@ func (d *Daemon) reconcileLiveSessionForScopeLocked(profile string, botName stri
 				return SessionRecord{}, false, false, nil, liveErr
 			}
 			if live {
+				if managedSessionConfigChanged(record, expectedRuntime, expectedModel) {
+					released, staleErr := d.markSessionStaleLocked(record, "managed_session_config_changed")
+					if staleErr != nil {
+						return SessionRecord{}, false, false, nil, staleErr
+					}
+					releasedMessages = append(releasedMessages, released...)
+					hadStale = true
+					continue
+				}
 				runtimeReason, runtimeErr := d.sessionRuntimeIssueLocked(record, record.State == "starting")
 				if runtimeErr != nil {
 					return SessionRecord{}, false, false, nil, runtimeErr
@@ -2932,6 +2949,13 @@ func sessionRecordMatchesTargetScope(record SessionRecord, profile string, botNa
 		return (labelsMatch && record.ScopeID == scopeID) || stableMatch
 	}
 	return record.ScopeID == scopeID && (labelsMatch || stableMatch)
+}
+
+func managedSessionConfigChanged(record SessionRecord, expectedRuntime string, expectedModel string) bool {
+	if expectedRuntime != "" && record.Runtime != expectedRuntime {
+		return true
+	}
+	return strings.TrimSpace(record.Model) != strings.TrimSpace(expectedModel)
 }
 
 func (d *Daemon) fenceDuplicateLiveSessionsLocked(matches []SessionRecord) (SessionRecord, []string, *SocketError) {
@@ -3040,7 +3064,7 @@ func (d *Daemon) ensureManagedSessionLockedWithContext(ctx context.Context, prof
 	if !managed {
 		return SessionRecord{}, false, false, nil
 	}
-	existing, ok, hadStale, staleReleasedMessages, existingErr := d.reconcileLiveSessionForScopeLocked(profile, botName, bot.BotID, botAgentID(bot), "profile", profile)
+	existing, ok, hadStale, staleReleasedMessages, existingErr := d.reconcileLiveSessionForScopeLocked(profile, botName, bot.BotID, botAgentID(bot), "profile", profile, bot.ManagedSession.Runtime, bot.ManagedSession.Model)
 	if existingErr != nil {
 		return SessionRecord{}, false, false, existingErr
 	}
@@ -3189,7 +3213,7 @@ func (d *Daemon) relaunchManagedBmuxSessionLocked(ctx context.Context, record Se
 		record.RuntimeSessionRef = runtimeSessionRef
 	}
 	record.BotletsHome = botletsHome
-	record.RuntimeCommand = managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, launchMode)
+	record.RuntimeCommand = managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, launchMode, record.Model)
 	record.PaneTarget = ""
 	record.StartupStartedAt = busTime(d.currentTime())
 	record.State = "starting"
@@ -3504,7 +3528,7 @@ func (d *Daemon) reconcileManagedSessionDailyReset(ctx context.Context, target m
 	if hasPending {
 		return d.continuePendingDailyResetLocked(ctx, target, pending, timezone, now)
 	}
-	record, ok, _, _, reconcileErr := d.reconcileLiveSessionForScopeLocked(target.Profile, target.BotName, target.Bot.BotID, botAgentID(target.Bot), "profile", target.Profile)
+	record, ok, _, _, reconcileErr := d.reconcileLiveSessionForScopeLocked(target.Profile, target.BotName, target.Bot.BotID, botAgentID(target.Bot), "profile", target.Profile, target.Bot.ManagedSession.Runtime, target.Bot.ManagedSession.Model)
 	if reconcileErr != nil {
 		return reconcileErr
 	}
@@ -3867,7 +3891,7 @@ func (d *Daemon) completeDailyResetReplacementLocked(ctx context.Context, target
 		}
 		releasedMessages = append(releasedMessages, released...)
 	}
-	replacement, ok, _, staleReleasedMessages, reconcileErr := d.reconcileLiveSessionForScopeLocked(target.Profile, target.BotName, target.Bot.BotID, botAgentID(target.Bot), "profile", target.Profile)
+	replacement, ok, _, staleReleasedMessages, reconcileErr := d.reconcileLiveSessionForScopeLocked(target.Profile, target.BotName, target.Bot.BotID, botAgentID(target.Bot), "profile", target.Profile, target.Bot.ManagedSession.Runtime, target.Bot.ManagedSession.Model)
 	if reconcileErr != nil {
 		return nil, reconcileErr
 	}

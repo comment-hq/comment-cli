@@ -494,7 +494,9 @@ func runDaemonWithContext(ctx context.Context, home string, botletsHome string, 
 		// that opted into "Responds to @mentions" replies without a manual
 		// `comment run`. The helper lives in package main; inject it into the
 		// daemon (which lives in package commentbus and can't import it).
-		MentionAutoStart: launchAgentRuntimeDetached,
+		MentionAutoStart: func(ctx context.Context, paths commentbus.Paths, handle string) error {
+			return launchAgentRuntimeDetached(ctx, paths, handle, "")
+		},
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {

@@ -2965,12 +2965,64 @@ func TestRunRuntimeParserPassesClaudeArgsWithoutDelimiter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.Runtime != "claude" || options.Profile != "max.reviewer" || options.CWD != "/tmp/work" || options.SetupAttemptID != "bla_1234567890abc" {
+	if options.Runtime != "claude" || options.Profile != "max.reviewer" || options.CWD != "/tmp/work" || options.SetupAttemptID != "bla_1234567890abc" || options.Model != "opus" || !options.ModelSet {
 		t.Fatalf("wrapper options = %+v", options)
 	}
-	wantArgs := []string{"--model", "opus", "--name", "Claude Session", "--tmux", "review this"}
+	wantArgs := []string{"--name", "Claude Session", "--tmux", "review this"}
 	if !slices.Equal(options.RuntimeArgs, wantArgs) {
 		t.Fatalf("runtime args = %#v, want %#v", options.RuntimeArgs, wantArgs)
+	}
+	wantCommandArgs := []string{"--model", "opus", "--name", "Claude Session", "--tmux", "review this"}
+	if !slices.Equal(runtimeArgsWithModel(options), wantCommandArgs) {
+		t.Fatalf("runtime command args = %#v, want %#v", runtimeArgsWithModel(options), wantCommandArgs)
+	}
+}
+
+func TestRunRuntimeParserAcceptsExplicitRuntimeRequestModelEnv(t *testing.T) {
+	t.Setenv(runtimeRequestModelExplicitEnv, "1")
+	t.Setenv(runtimeRequestModelEnv, "")
+
+	options, err := parseRuntimeRunArgs([]string{
+		"--runtime", "claude",
+		"--profile", "max.reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.Model != "" || !options.ModelSet {
+		t.Fatalf("runtime request model options = %+v, want explicit empty model", options)
+	}
+
+	t.Setenv(runtimeRequestModelEnv, " opus ")
+	options, err = parseRuntimeRunArgs([]string{
+		"--runtime", "claude",
+		"--profile", "max.reviewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.Model != "opus" || !options.ModelSet {
+		t.Fatalf("runtime request model options = %+v, want explicit opus model", options)
+	}
+}
+
+func TestManagedStartLegacyRetryRejectsModelIntent(t *testing.T) {
+	response := commentbus.SocketResponse{
+		OK: false,
+		Error: &commentbus.SocketError{
+			Code:    "VALIDATION_ERROR",
+			Message: "unexpected param: requested_model",
+		},
+	}
+
+	if err := managedStartLegacyModelRetryError(response, "opus", false); err == nil || !strings.Contains(err.Error(), "managed-session model preferences") {
+		t.Fatalf("model retry error = %v, want managed-session model preferences error", err)
+	}
+	if err := managedStartLegacyModelRetryError(response, "", true); err == nil || !strings.Contains(err.Error(), "managed-session model preferences") {
+		t.Fatalf("explicit model-clear retry error = %v, want managed-session model preferences error", err)
+	}
+	if err := managedStartLegacyModelRetryError(response, "", false); err != nil {
+		t.Fatalf("runtime-only legacy retry should be allowed, got %v", err)
 	}
 }
 

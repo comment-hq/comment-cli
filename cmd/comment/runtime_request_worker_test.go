@@ -61,15 +61,19 @@ func newRuntimeRequestTestServer(t *testing.T, pending []agentRuntimeRequestList
 
 func TestRuntimeRequestWorkerLaunchesAndAcksStarted(t *testing.T) {
 	paths := testAgentEnrollmentPaths(t)
-	var launched []string
+	type launch struct {
+		handle string
+		model  string
+	}
+	var launched []launch
 	prev := runtimeRequestLaunch
-	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, handle string) error {
-		launched = append(launched, handle)
+	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, handle string, model string) error {
+		launched = append(launched, launch{handle: handle, model: model})
 		return nil
 	}
 	t.Cleanup(func() { runtimeRequestLaunch = prev })
 
-	pending := []agentRuntimeRequestListItem{{RequestID: "rtr_abc", State: "pending", AgentID: "ag_1", Handle: "max.reviewer", DaemonID: "ld_worker-test"}}
+	pending := []agentRuntimeRequestListItem{{RequestID: "rtr_abc", State: "pending", AgentID: "ag_1", Handle: "max.reviewer", DaemonID: "ld_worker-test", Model: "opus"}}
 	server, acks := newRuntimeRequestTestServer(t, pending)
 	writeEnrollmentDaemonAuth(t, paths, server.URL, testRuntimeRequestDaemonToken)
 	worker := &agentRuntimeRequestWorker{paths: paths}
@@ -77,8 +81,8 @@ func TestRuntimeRequestWorkerLaunchesAndAcksStarted(t *testing.T) {
 	if wait := worker.runOnce(context.Background()); wait != runtimeRequestPollInterval {
 		t.Fatalf("wait = %v, want %v", wait, runtimeRequestPollInterval)
 	}
-	if len(launched) != 1 || launched[0] != "max.reviewer" {
-		t.Fatalf("launched = %v, want [max.reviewer]", launched)
+	if len(launched) != 1 || launched[0] != (launch{handle: "max.reviewer", model: "opus"}) {
+		t.Fatalf("launched = %v, want [{max.reviewer opus}]", launched)
 	}
 	if len(*acks) != 1 {
 		t.Fatalf("acks = %v, want 1", *acks)
@@ -94,7 +98,7 @@ func TestRuntimeRequestWorkerLaunchesAndAcksStarted(t *testing.T) {
 func TestRuntimeRequestWorkerAcksFailedOnLaunchError(t *testing.T) {
 	paths := testAgentEnrollmentPaths(t)
 	prev := runtimeRequestLaunch
-	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string) error {
+	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string, _ string) error {
 		return errors.New("runtime not found")
 	}
 	t.Cleanup(func() { runtimeRequestLaunch = prev })
@@ -117,7 +121,7 @@ func TestRuntimeRequestWorkerDoesNotRelaunchAfterAckFailure(t *testing.T) {
 	paths := testAgentEnrollmentPaths(t)
 	launchCount := 0
 	prev := runtimeRequestLaunch
-	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string) error {
+	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string, _ string) error {
 		launchCount++
 		return nil
 	}
@@ -159,7 +163,7 @@ func TestRuntimeRequestWorkerNoopsWhenUnpaired(t *testing.T) {
 	paths := testAgentEnrollmentPaths(t)
 	called := false
 	prev := runtimeRequestLaunch
-	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string) error {
+	runtimeRequestLaunch = func(_ context.Context, _ commentbus.Paths, _ string, _ string) error {
 		called = true
 		return nil
 	}
@@ -171,6 +175,27 @@ func TestRuntimeRequestWorkerNoopsWhenUnpaired(t *testing.T) {
 	}
 	if called {
 		t.Fatal("launch must not be called while unpaired")
+	}
+}
+
+func TestRuntimeRequestModelEnvMarksEmptyModelExplicit(t *testing.T) {
+	env := withRuntimeRequestModelEnv([]string{
+		runtimeRequestModelExplicitEnv + "=0",
+		runtimeRequestModelEnv + "=stale",
+		"COMMENT_IO_HOME=/custom/home",
+	}, "")
+
+	if got := envValue(env, runtimeRequestModelExplicitEnv); got != "1" {
+		t.Fatalf("%s = %q, want 1", runtimeRequestModelExplicitEnv, got)
+	}
+	if got := envValue(env, runtimeRequestModelEnv); got != "" {
+		t.Fatalf("%s = %q, want empty explicit override", runtimeRequestModelEnv, got)
+	}
+	if n := envCount(env, runtimeRequestModelExplicitEnv); n != 1 {
+		t.Fatalf("%s appears %d times, want exactly 1", runtimeRequestModelExplicitEnv, n)
+	}
+	if n := envCount(env, runtimeRequestModelEnv); n != 1 {
+		t.Fatalf("%s appears %d times, want exactly 1", runtimeRequestModelEnv, n)
 	}
 }
 

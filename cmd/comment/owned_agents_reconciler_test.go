@@ -620,7 +620,7 @@ func TestOwnedAgentsReconcilerBotletsKindRequiresRegistryEntry(t *testing.T) {
 // opt-in, and brain setup generation, so a test can assert the reconciler
 // re-enrolls when the manifest's DESIRED state diverges from what is installed
 // (Codex round-9).
-func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, runtime, timezone string, respondsToMentions bool, setupGeneration int) {
+func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, runtime, model, timezone string, respondsToMentions bool, setupGeneration int) {
 	t.Helper()
 	if err := os.MkdirAll(botletsHome, 0o700); err != nil {
 		t.Fatal(err)
@@ -631,6 +631,7 @@ func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, r
 		"managed_session": map[string]any{
 			"enabled":  true,
 			"runtime":  runtime,
+			"model":    model,
 			"timezone": timezone,
 		},
 		"responds_to_mentions": respondsToMentions,
@@ -652,12 +653,13 @@ func writeOwnedAgentsBotletsRegistryDesired(t *testing.T, botletsHome, handle, r
 	}
 }
 
-func ownedAgentsManifestBotletsDesiredPayload(agentID, handle, runtime, timezone string, respondsToMentions bool, setupGeneration int) map[string]any {
+func ownedAgentsManifestBotletsDesiredPayload(agentID, handle, runtime, model, timezone string, respondsToMentions bool, setupGeneration int) map[string]any {
 	return map[string]any{
 		"agent_id":             agentID,
 		"handle":               handle,
 		"display_name":         "Bot " + handle,
 		"runtime":              runtime,
+		"model":                model,
 		"schedule_timezone":    timezone,
 		"responds_to_mentions": respondsToMentions,
 		// Brain block mirrors the cf manifest: setup_generation is NESTED here,
@@ -713,7 +715,7 @@ func TestOwnedAgentsReconcilerKeepsCodexProfileWhenManifestRuntimeNull(t *testin
 	if worker.lastFingerprint != "fp_generic" {
 		t.Fatalf("lastFingerprint = %q, want fp_generic cached when the codex install is left alone", worker.lastFingerprint)
 	}
-	rt, ok := agentProfileRuntime(agentProfileFilePath(paths, "max.codexbot"))
+	rt, _, ok := agentProfileRuntimeAndModel(agentProfileFilePath(paths, "max.codexbot"))
 	if !ok || rt != "codex" {
 		t.Fatalf("installed runtime = %q ok=%v, want codex left in place", rt, ok)
 	}
@@ -723,6 +725,7 @@ func TestOwnedAgentsReconcilerReinstallsOnDesiredStateChange(t *testing.T) {
 	cases := []struct {
 		name               string
 		runtime            string
+		model              string
 		timezone           string
 		respondsToMentions bool
 		setupGen           int
@@ -732,27 +735,28 @@ func TestOwnedAgentsReconcilerReinstallsOnDesiredStateChange(t *testing.T) {
 		botID              string
 		wantReinstall      bool
 	}{
-		{name: "in-sync", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: false},
-		{name: "runtime-change", runtime: "codex", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: true},
-		{name: "timezone-change", runtime: "claude", timezone: "Europe/Berlin", respondsToMentions: true, setupGen: 3, wantReinstall: true},
+		{name: "in-sync", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: false},
+		{name: "runtime-change", runtime: "codex", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: true},
+		{name: "model-change", runtime: "claude", model: "opus-remote", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, wantReinstall: true},
+		{name: "timezone-change", runtime: "claude", model: "sonnet-local", timezone: "Europe/Berlin", respondsToMentions: true, setupGen: 3, wantReinstall: true},
 		// Toggling "Responds to @mentions" must re-enroll so the local registry's
 		// flag converges and the daemon's mention auto-launch gate reads it.
-		{name: "responds-to-mentions-on", runtime: "claude", timezone: "America/New_York", respondsToMentions: false, setupGen: 3, wantReinstall: true},
-		{name: "setup-generation-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 4, wantReinstall: true},
-		{name: "brain-ref-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, brainContainer: "c_2", wantReinstall: true},
-		{name: "owner-agent-id-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, ownerAgentID: "ag_owner_2", wantReinstall: true},
-		{name: "bot-agent-id-change", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botAgentID: "ag_bot_agent_2", wantReinstall: true},
+		{name: "responds-to-mentions-on", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: false, setupGen: 3, wantReinstall: true},
+		{name: "setup-generation-change", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 4, wantReinstall: true},
+		{name: "brain-ref-change", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, brainContainer: "c_2", wantReinstall: true},
+		{name: "owner-agent-id-change", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, ownerAgentID: "ag_owner_2", wantReinstall: true},
+		{name: "bot-agent-id-change", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botAgentID: "ag_bot_agent_2", wantReinstall: true},
 		// bot_id is the immutable durable bot identity, not stored in brain_ref:
 		// a changed manifest bot_id alone must NOT churn a re-enroll for a stable
 		// handle (a different bot is a different handle entirely).
-		{name: "bot-id-change-only", runtime: "claude", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botID: "bot_2", wantReinstall: false},
+		{name: "bot-id-change-only", runtime: "claude", model: "sonnet-local", timezone: "America/New_York", respondsToMentions: true, setupGen: 3, botID: "bot_2", wantReinstall: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			paths := testAgentEnrollmentPaths(t)
 			botletsHome := filepath.Join(t.TempDir(), "botlets")
 			payload := ownedAgentsManifestBotletsDesiredPayload(
-				"ag_bot", "max.bot", tc.runtime, tc.timezone, tc.respondsToMentions, tc.setupGen)
+				"ag_bot", "max.bot", tc.runtime, tc.model, tc.timezone, tc.respondsToMentions, tc.setupGen)
 			if tc.brainContainer != "" {
 				payload["brain"].(map[string]any)["container_id"] = tc.brainContainer
 			}
@@ -772,8 +776,8 @@ func TestOwnedAgentsReconcilerReinstallsOnDesiredStateChange(t *testing.T) {
 			writeEnrollmentDaemonAuth(t, paths, server.URL, testEnrollmentDaemonToken)
 			writeInstalledAgentProfile(t, paths, "max.bot")
 			// Installed state: runtime claude, NY timezone, responds-to-mentions on,
-			// setup generation 3.
-			writeOwnedAgentsBotletsRegistryDesired(t, botletsHome, "max.bot", "claude", "America/New_York", true, 3)
+			// model sonnet-local, and setup generation 3.
+			writeOwnedAgentsBotletsRegistryDesired(t, botletsHome, "max.bot", "claude", "sonnet-local", "America/New_York", true, 3)
 			worker := newOwnedAgentsReconciler(paths)
 			worker.botletsHomeHint = botletsHome
 

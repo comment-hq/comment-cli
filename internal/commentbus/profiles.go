@@ -23,6 +23,7 @@ type AgentProfile struct {
 	AgentSecret string
 	BaseURL     string
 	Runtime     string
+	Model       string
 	Path        string
 }
 
@@ -83,6 +84,7 @@ const (
 type ManagedSessionSetting struct {
 	Enabled  bool   `json:"enabled"`
 	Runtime  string `json:"runtime"`
+	Model    string `json:"model,omitempty"`
 	Host     string `json:"host,omitempty"`
 	Timezone string `json:"timezone,omitempty"`
 }
@@ -246,6 +248,7 @@ func readAgentProfileOrAliasFile(path string, handle string, defaultBaseURL stri
 		AgentSecret        string `json:"agent_secret"`
 		BaseURL            string `json:"base_url"`
 		Runtime            string `json:"runtime"`
+		Model              string `json:"model"`
 		AliasOf            string `json:"alias_of"`
 		BotID              string `json:"bot_id"`
 		BotAgentID         string `json:"bot_agent_id"`
@@ -298,11 +301,16 @@ func readAgentProfileOrAliasFile(path string, handle string, defaultBaseURL stri
 	if profileRuntime != "" && profileRuntime != "claude" && profileRuntime != "codex" {
 		return AgentProfile{}, nil, errors.New("invalid profile runtime")
 	}
+	profileModel, ok := normalizeAgentModel(raw.Model)
+	if !ok {
+		return AgentProfile{}, nil, errors.New("invalid profile model")
+	}
 	return AgentProfile{
 		Handle:      handle,
 		AgentSecret: raw.AgentSecret,
 		BaseURL:     baseURL,
 		Runtime:     profileRuntime,
+		Model:       profileModel,
 		Path:        cleanPath,
 	}, nil, nil
 }
@@ -389,6 +397,7 @@ func ValidateBotletsRegistryEntries(botletsHome string, profiles map[string]Agen
 		if bot.ManagedSession.Enabled {
 			bot.RegistryRuntime = bot.ManagedSession.Runtime
 			bot.ManagedSession.Runtime = managedSessionRuntimeForProfile(profile, bot.ManagedSession.Runtime)
+			bot.ManagedSession.Model = managedSessionModelForProfile(profile, bot.ManagedSession.Model)
 			bot.ManagedSession.Host = normalizeNewManagedSessionHost(bot.ManagedSession.Host)
 		}
 		storeRegistryLabels(seenNames, botRegistryNameLabels(bot), identityKey)
@@ -407,6 +416,17 @@ func managedSessionRuntimeForProfile(profile AgentProfile, fallback string) stri
 		return fallback
 	}
 	return "claude"
+}
+
+func managedSessionModelForProfile(profile AgentProfile, fallback string) string {
+	if profile.Model != "" {
+		return profile.Model
+	}
+	model, ok := normalizeAgentModel(fallback)
+	if !ok {
+		return ""
+	}
+	return model
 }
 
 func profilesByCredentialPath(profiles map[string]AgentProfile) map[string]AgentProfile {
@@ -505,6 +525,11 @@ func validateRegistryBotShape(bot BotRegistryEntry) error {
 	}
 	if bot.ManagedSession.Enabled && bot.ManagedSession.Runtime != "" && bot.ManagedSession.Runtime != "claude" && bot.ManagedSession.Runtime != "codex" {
 		return errors.New("invalid managed session runtime")
+	}
+	if bot.ManagedSession.Enabled {
+		if _, ok := normalizeAgentModel(bot.ManagedSession.Model); !ok {
+			return errors.New("invalid managed session model")
+		}
 	}
 	if bot.ManagedSession.Enabled && !isSessionHost(bot.ManagedSession.Host) {
 		return errors.New("invalid managed session host")

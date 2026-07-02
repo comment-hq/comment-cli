@@ -268,6 +268,148 @@ func TestDaemonManagedSessionStartsInBotletsBrainRoot(t *testing.T) {
 	}
 }
 
+func TestDaemonManagedSessionModelChangeStalesLiveSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	capability := loadMessageTestBots(t, paths)
+
+	start := requestDaemon(t, paths, map[string]any{
+		"id": "req_modelstale-start1",
+		"op": "sessions.start",
+		"auth": map[string]any{
+			"mode":       "owner",
+			"capability": capability,
+		},
+		"params": map[string]any{"bot": "reviewer"},
+	})
+	if !start.OK {
+		t.Fatalf("first start failed: %+v", start.Error)
+	}
+	firstSession := start.Result.(map[string]any)["session"].(map[string]any)
+	firstSessionID := firstSession["session_id"].(string)
+
+	daemon.profileMu.Lock()
+	bot := daemon.profileState.BotRegistry["reviewer"]
+	bot.ManagedSession.Model = "opus"
+	daemon.profileState.BotRegistry["reviewer"] = bot
+	daemon.profileMu.Unlock()
+
+	second := requestDaemon(t, paths, map[string]any{
+		"id": "req_modelstale-start2",
+		"op": "sessions.start",
+		"auth": map[string]any{
+			"mode":       "owner",
+			"capability": capability,
+		},
+		"params": map[string]any{"bot": "reviewer"},
+	})
+	if !second.OK {
+		t.Fatalf("second start failed: %+v", second.Error)
+	}
+	secondSession := second.Result.(map[string]any)["session"].(map[string]any)
+	secondSessionID := secondSession["session_id"].(string)
+	if secondSessionID == firstSessionID {
+		t.Fatalf("model change reused stale session %s", firstSessionID)
+	}
+
+	oldRecord, err := ReadSessionRecord(paths, firstSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldRecord.State != "stale" {
+		t.Fatalf("old model session state = %+v", oldRecord)
+	}
+	newRecord, err := ReadSessionRecord(paths, secondSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newRecord.State != "alive" || newRecord.Model != "opus" {
+		t.Fatalf("new model session record = %+v", newRecord)
+	}
+	wantCommand := []string{"claude", "--model", "opus", "--dangerously-skip-permissions"}
+	if strings.Join(newRecord.RuntimeCommand, "\x00") != strings.Join(wantCommand, "\x00") {
+		t.Fatalf("new model runtime command = %#v, want %#v", newRecord.RuntimeCommand, wantCommand)
+	}
+}
+
+func TestDaemonManagedSessionRequestedModelOverridesRegistry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	capability := loadMessageTestBots(t, paths)
+
+	daemon.profileMu.Lock()
+	bot := daemon.profileState.BotRegistry["reviewer"]
+	bot.ManagedSession.Model = "stale-local-registry"
+	daemon.profileState.BotRegistry["reviewer"] = bot
+	daemon.profileMu.Unlock()
+
+	clear := requestDaemon(t, paths, map[string]any{
+		"id": "req_modeloverride-clear",
+		"op": "sessions.start",
+		"auth": map[string]any{
+			"mode":       "owner",
+			"capability": capability,
+		},
+		"params": map[string]any{"bot": "reviewer", "requested_model": "", "requested_model_set": true},
+	})
+	if !clear.OK {
+		t.Fatalf("clear model start failed: %+v", clear.Error)
+	}
+	clearSession := clear.Result.(map[string]any)["session"].(map[string]any)
+	clearSessionID := clearSession["session_id"].(string)
+	clearRecord, err := ReadSessionRecord(paths, clearSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clearRecord.Model != "" {
+		t.Fatalf("cleared requested model session record = %+v, want empty model", clearRecord)
+	}
+	wantClearCommand := []string{"claude", "--dangerously-skip-permissions"}
+	if strings.Join(clearRecord.RuntimeCommand, "\x00") != strings.Join(wantClearCommand, "\x00") {
+		t.Fatalf("cleared model runtime command = %#v, want %#v", clearRecord.RuntimeCommand, wantClearCommand)
+	}
+
+	set := requestDaemon(t, paths, map[string]any{
+		"id": "req_modeloverride-set",
+		"op": "sessions.start",
+		"auth": map[string]any{
+			"mode":       "owner",
+			"capability": capability,
+		},
+		"params": map[string]any{"bot": "reviewer", "requested_model": "opus", "requested_model_set": true},
+	})
+	if !set.OK {
+		t.Fatalf("set model start failed: %+v", set.Error)
+	}
+	setSession := set.Result.(map[string]any)["session"].(map[string]any)
+	setSessionID := setSession["session_id"].(string)
+	if setSessionID == clearSessionID {
+		t.Fatalf("requested model change reused stale session %s", clearSessionID)
+	}
+	oldRecord, err := ReadSessionRecord(paths, clearSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldRecord.State != "stale" {
+		t.Fatalf("cleared model session state = %+v, want stale", oldRecord)
+	}
+	setRecord, err := ReadSessionRecord(paths, setSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setRecord.Model != "opus" {
+		t.Fatalf("requested model session record = %+v, want opus", setRecord)
+	}
+	wantSetCommand := []string{"claude", "--model", "opus", "--dangerously-skip-permissions"}
+	if strings.Join(setRecord.RuntimeCommand, "\x00") != strings.Join(wantSetCommand, "\x00") {
+		t.Fatalf("requested model runtime command = %#v, want %#v", setRecord.RuntimeCommand, wantSetCommand)
+	}
+}
+
 func TestDaemonReloadProfilesPreservesPreviousStateOnErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1937,7 +2079,7 @@ func TestDaemonBmuxRecoverDeadRuntimeRelaunchesWithClaudeResumeAndNudges(t *test
 	fixture.bmux.deadChildren[record.SessionName] = true
 	fixture.bmux.mu.Unlock()
 	fixture.daemon.sessionMu.Lock()
-	recovered, ok, hadStale, released, recoverErr := fixture.daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer")
+	recovered, ok, hadStale, released, recoverErr := fixture.daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer", "claude", "")
 	fixture.daemon.sessionMu.Unlock()
 	if recoverErr != nil || !ok || hadStale || len(released) != 0 {
 		t.Fatalf("reconcile = record:%+v ok:%v hadStale:%v released:%+v err:%+v", recovered, ok, hadStale, released, recoverErr)
@@ -2006,7 +2148,7 @@ func TestDaemonBmuxRecoverDeadSocketNoOrphanResumesInPlace(t *testing.T) {
 	delete(fixture.bmux.sessions, record.SessionName)
 	fixture.bmux.mu.Unlock()
 	fixture.daemon.sessionMu.Lock()
-	recovered, ok, hadStale, released, recoverErr := fixture.daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer")
+	recovered, ok, hadStale, released, recoverErr := fixture.daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer", "claude", "")
 	fixture.daemon.sessionMu.Unlock()
 	if recoverErr != nil || !ok || hadStale || len(released) != 0 {
 		t.Fatalf("reconcile = record:%+v ok:%v hadStale:%v released:%+v err:%+v", recovered, ok, hadStale, released, recoverErr)
@@ -2976,7 +3118,7 @@ func TestDaemonBmuxReconcileAlreadyStaleCleansControlSession(t *testing.T) {
 	bmux.mu.Unlock()
 
 	daemon.sessionMu.Lock()
-	_, ok, hadStale, _, staleErr := daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer")
+	_, ok, hadStale, _, staleErr := daemon.reconcileLiveSessionForScopeLocked("max.reviewer", "reviewer", "", "", "profile", "max.reviewer", "claude", "")
 	daemon.sessionMu.Unlock()
 	if staleErr != nil {
 		t.Fatalf("reconcile stale bmux failed: %+v", staleErr)

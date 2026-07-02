@@ -66,6 +66,29 @@ func TestPrepareAgentProfileWriteAcceptsEmptyRuntime(t *testing.T) {
 	}
 }
 
+func TestNormalizeAgentModelUsesServerLengthUnits(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		ok    bool
+	}{
+		{"ascii at limit", strings.Repeat("a", 120), true},
+		{"ascii over limit", strings.Repeat("a", 121), false},
+		{"multibyte BMP at limit", strings.Repeat("é", 120), true},
+		{"multibyte BMP over limit", strings.Repeat("é", 121), false},
+		{"astral at limit", strings.Repeat("🧠", 60), true},
+		{"astral over limit", strings.Repeat("🧠", 61), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := NormalizeAgentModel(tc.model)
+			if ok != tc.ok {
+				t.Fatalf("NormalizeAgentModel(%q) ok = %v, want %v", tc.model, ok, tc.ok)
+			}
+		})
+	}
+}
+
 func TestAgentProfileWriteWritesPrivateFileWithExpectedJSON(t *testing.T) {
 	paths, err := ResolvePaths(filepath.Join(t.TempDir(), ".comment-io"))
 	if err != nil {

@@ -139,6 +139,41 @@ func TestDockerRuntimeDelegatesShortcutWhenHostDaemonUnavailable(t *testing.T) {
 	}
 }
 
+func TestDockerRuntimeDelegatesExplicitModelClear(t *testing.T) {
+	resetDockerRuntimeEnv(t)
+	paths, err := resolveCLIPaths("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDockerRuntimeInstallMarker(paths, dockerRuntimeTarget{
+		BaseURL:   "https://comment.io",
+		Container: "comment-agent-comment-io",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	calls := stubDockerRuntime(t, "https://comment.io")
+
+	err = defaultRunRuntimeCommand(runtimeRunOptions{
+		BotShortcut: "max.reviewer",
+		Role:        commentbus.RuntimeRoleMain,
+		ModelSet:    true,
+		Detach:      true,
+	})
+	if err != nil {
+		t.Fatalf("defaultRunRuntimeCommand returned error: %v", err)
+	}
+	want := []string{
+		"/fake/docker", "exec",
+		"-e", "COMMENT_IO_AGENT_SANDBOX=1",
+		"-e", "COMMENT_IO_RUNTIME_REQUEST_MODEL_EXPLICIT=1",
+		"-e", "COMMENT_IO_RUNTIME_REQUEST_MODEL=",
+		"comment-agent-comment-io", "comment", "run", "--detach", "max.reviewer",
+	}
+	if !slices.Equal(calls.run, want) {
+		t.Fatalf("docker run args = %#v, want %#v", calls.run, want)
+	}
+}
+
 func TestDockerRuntimeRootShorthandPreservesRuntimeArgs(t *testing.T) {
 	resetDockerRuntimeEnv(t)
 	paths, err := resolveCLIPaths("")
@@ -177,6 +212,26 @@ func TestDockerRuntimeRootShorthandPreservesRuntimeArgs(t *testing.T) {
 	}
 	if len(calls.run) < len(wantSuffix) || !slices.Equal(calls.run[len(calls.run)-len(wantSuffix):], wantSuffix) {
 		t.Fatalf("docker run args = %#v, want suffix %#v", calls.run, wantSuffix)
+	}
+}
+
+func TestDockerRuntimeDelegatedArgvForwardsModel(t *testing.T) {
+	got := dockerRuntimeDelegatedArgv(runtimeRunOptions{
+		Runtime:     "claude",
+		Profile:     "max.reviewer",
+		Model:       "opus",
+		RuntimeArgs: []string{"--name", "Claude Session"},
+	})
+	want := []string{
+		"run",
+		"--runtime", "claude",
+		"--profile", "max.reviewer",
+		"--model", "opus",
+		"--",
+		"--name", "Claude Session",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("delegated argv = %#v, want %#v", got, want)
 	}
 }
 

@@ -54,7 +54,7 @@ func botletsUsage() string {
 	return strings.Join([]string{
 		"Usage:",
 		"  comment botlets setup --bot <owner.slug|slug> [--owner <handle>] [--runtime claude|codex] [--home ~/.comment-io] [--botlets-home ~/botlets] [--base-url URL] [--timeout 10m] [--setup-attempt-id ID] [--json]",
-		"  comment botlets register --handle <owner.slug> --bot-slug <slug> --bot-agent-id <id> --owner-agent-id <id> --workspace-id <id> --container-id <id> --root-folder-id <id> --setup-generation <n> [--bot-id <id>] [--slug-alias <slug[,slug]>] [--handle-alias <handle[,handle]>] [--display-name <name>] [--timezone <tz>] [--runtime claude|codex] [--secret-stdin|--secret <secret>] [--base-url URL] [--home ~/.comment-io] [--botlets-home ~/botlets] [--json]",
+		"  comment botlets register --handle <owner.slug> --bot-slug <slug> --bot-agent-id <id> --owner-agent-id <id> --workspace-id <id> --container-id <id> --root-folder-id <id> --setup-generation <n> [--bot-id <id>] [--slug-alias <slug[,slug]>] [--handle-alias <handle[,handle]>] [--display-name <name>] [--timezone <tz>] [--runtime claude|codex] [--model <model>] [--secret-stdin|--secret <secret>] [--base-url URL] [--home ~/.comment-io] [--botlets-home ~/botlets] [--json]",
 		"  comment botlets team-setup --workspace-id <bw_id> --code <setupCodeId> [--token-stdin|--token <token>] [--runtime claude|codex] [--base-url URL] [--home ~/.comment-io] [--botlets-home ~/botlets] [--json]",
 		"  comment botlets team-resync [--home ~/.comment-io] [--botlets-home ~/botlets] [--json]",
 		"  comment botlets session reset --log-path <path> [--home ~/.comment-io]",
@@ -112,6 +112,7 @@ type botletsSetupPollResponse struct {
 	HandleAliases            []string `json:"handle_aliases,omitempty"`
 	SetupGeneration          int      `json:"setup_generation,omitempty"`
 	SetupAttemptID           string   `json:"setup_attempt_id,omitempty"`
+	Model                    string   `json:"model,omitempty"`
 	ScheduleTimezone         string   `json:"schedule_timezone,omitempty"`
 	RespondsToMentions       bool     `json:"responds_to_mentions,omitempty"`
 	Brain                    struct {
@@ -309,6 +310,7 @@ func runBotletsSetup(args []string) (err error) {
 		ScheduleTimezone:   poll.ScheduleTimezone,
 		RespondsToMentions: poll.RespondsToMentions,
 		Runtime:            runtime,
+		Model:              poll.Model,
 	})
 	if err != nil {
 		return err
@@ -477,6 +479,7 @@ type botletsRegisterInput struct {
 	SetupGeneration  int
 	ScheduleTimezone string
 	Runtime          string
+	Model            string
 	// RespondsToMentions mirrors the bot's "Responds to @mentions" opt-in
 	// (owned-agents manifest / enrollment hint) into the registry entry so the
 	// daemon can auto-launch the runtime on a doc @mention. Defaults to false.
@@ -511,10 +514,11 @@ func registerBotletsBotLocally(ctx context.Context, in botletsRegisterInput) (bo
 	if in.Runtime != "claude" && in.Runtime != "codex" {
 		return botletsRegisterResult{}, errors.New("invalid Botlets runtime")
 	}
-	profileWrite, err := prepareBotletsAgentProfileWithRuntime(in.Paths, in.BotHandle, in.AgentSecret, in.BaseURL, in.Runtime)
+	profileWrite, err := prepareBotletsAgentProfileWithRuntimeAndModel(in.Paths, in.BotHandle, in.AgentSecret, in.BaseURL, in.Runtime, in.Model)
 	if err != nil {
 		return botletsRegisterResult{}, err
 	}
+	model := profileWrite.profile.Model
 	profilePath := profileWrite.path
 	query := commentsync.BotletsBrainProjectionQuery{
 		WorkspaceID:  in.WorkspaceID,
@@ -550,7 +554,7 @@ func registerBotletsBotLocally(ctx context.Context, in botletsRegisterInput) (bo
 			RelativePath:    projection.RelativePath,
 			SetupGeneration: in.SetupGeneration,
 		},
-		ManagedSession:     commentbus.ManagedSessionSetting{Enabled: true, Runtime: in.Runtime, Timezone: in.ScheduleTimezone},
+		ManagedSession:     commentbus.ManagedSessionSetting{Enabled: true, Runtime: in.Runtime, Model: model, Timezone: in.ScheduleTimezone},
 		RespondsToMentions: in.RespondsToMentions,
 	}
 	var aliasWrites []botletsAgentProfileAliasWrite
@@ -615,6 +619,7 @@ func runBotletsRegister(args []string) error {
 	timezoneFlag := fs.String("timezone", "", "schedule timezone")
 	respondsToMentionsFlag := fs.Bool("responds-to-mentions", false, "auto-launch the bot's runtime on a doc @mention")
 	runtimeFlag := fs.String("runtime", "claude", "managed runtime (claude or codex)")
+	modelFlag := fs.String("model", "", "managed runtime model")
 	secretFlag := fs.String("secret", "", "agent secret (prefer --secret-stdin)")
 	secretStdin := fs.Bool("secret-stdin", false, "read the agent secret from stdin")
 	jsonOut := fs.Bool("json", false, "print JSON")
@@ -706,6 +711,7 @@ func runBotletsRegister(args []string) error {
 		ScheduleTimezone:   strings.TrimSpace(*timezoneFlag),
 		RespondsToMentions: *respondsToMentionsFlag,
 		Runtime:            runtime,
+		Model:              strings.TrimSpace(*modelFlag),
 	})
 	if err != nil {
 		return err
@@ -1089,6 +1095,7 @@ func resyncBotletsTeamManifest(ctx context.Context, client *http.Client, paths c
 			OwnerAgentID    string `json:"owner_agent_id"`
 			BotID           string `json:"bot_id"`
 			SetupGeneration int    `json:"setup_generation"`
+			Model           string `json:"model"`
 			// ScheduleTimezone is the bot's configured schedule timezone,
 			// mirrored into the local registry entry's managed-session setting
 			// so daily session resets follow the bot's timezone — the same
@@ -1128,7 +1135,7 @@ func resyncBotletsTeamManifest(ctx context.Context, client *http.Client, paths c
 			BotID: a.BotID, OwnerAgentID: a.OwnerAgentID, BotAgentID: a.BotAgentID,
 			WorkspaceID: a.Brain.WorkspaceID, ContainerID: a.Brain.ContainerID, RootFolderID: a.Brain.RootFolderID,
 			SetupGeneration: gen, ScheduleTimezone: strings.TrimSpace(a.ScheduleTimezone),
-			RespondsToMentions: a.RespondsToMentions, Runtime: runtime,
+			RespondsToMentions: a.RespondsToMentions, Runtime: runtime, Model: strings.TrimSpace(a.Model),
 		})
 		if err != nil {
 			// Best-effort per-bot visibility (Phase 9b): mark the binding
@@ -1959,7 +1966,7 @@ func reconcileBotletsRegistryAfterCompletion(paths commentbus.Paths, botletsHome
 	changed := false
 	profileWrite := botletsAgentProfileWrite{}
 	if botHandle, ok := complete["bot_handle"].(string); ok && botHandle != "" && !strings.EqualFold(botHandle, entry.Handle) {
-		prepared, err := prepareBotletsAgentProfileWithRuntime(paths, botHandle, agentSecret, baseURL, entry.ManagedSession.Runtime)
+		prepared, err := prepareBotletsAgentProfileWithRuntimeAndModel(paths, botHandle, agentSecret, baseURL, entry.ManagedSession.Runtime, entry.ManagedSession.Model)
 		if err != nil {
 			return commentbus.BotRegistryEntry{}, err
 		}
@@ -2113,7 +2120,11 @@ func prepareBotletsAgentProfile(paths commentbus.Paths, handle string, agentSecr
 }
 
 func prepareBotletsAgentProfileWithRuntime(paths commentbus.Paths, handle string, agentSecret string, baseURL string, runtime string) (botletsAgentProfileWrite, error) {
-	write, err := commentbus.PrepareAgentProfileWrite(paths, handle, agentSecret, baseURL, runtime)
+	return prepareBotletsAgentProfileWithRuntimeAndModel(paths, handle, agentSecret, baseURL, runtime, "")
+}
+
+func prepareBotletsAgentProfileWithRuntimeAndModel(paths commentbus.Paths, handle string, agentSecret string, baseURL string, runtime string, model string) (botletsAgentProfileWrite, error) {
+	write, err := commentbus.PrepareAgentProfileWriteWithModel(paths, handle, agentSecret, baseURL, runtime, model)
 	if err != nil {
 		// Preserve the Botlets-specific phrasing that call sites and tests
 		// assert on; the shared helper reports product-neutral messages.
@@ -2124,6 +2135,8 @@ func prepareBotletsAgentProfileWithRuntime(paths commentbus.Paths, handle string
 			return botletsAgentProfileWrite{}, errors.New("invalid Botlets agent handle")
 		case errors.Is(err, commentbus.ErrInvalidAgentRuntime):
 			return botletsAgentProfileWrite{}, errors.New("invalid Botlets runtime")
+		case errors.Is(err, commentbus.ErrInvalidAgentModel):
+			return botletsAgentProfileWrite{}, errors.New("invalid Botlets model")
 		}
 		return botletsAgentProfileWrite{}, err
 	}
@@ -2166,7 +2179,7 @@ func prepareBotletsCredentialProfileRenameRepair(paths commentbus.Paths, botlets
 	if !strings.EqualFold(oldProfile.Handle, previous.Handle) {
 		return botletsCredentialProfileRenameRepair{}, false, nil
 	}
-	profileWrite, err := prepareBotletsAgentProfileWithRuntime(paths, candidate.Handle, oldProfile.AgentSecret, oldProfile.BaseURL, firstNonEmpty(oldProfile.Runtime, previous.ManagedSession.Runtime))
+	profileWrite, err := prepareBotletsAgentProfileWithRuntimeAndModel(paths, candidate.Handle, oldProfile.AgentSecret, oldProfile.BaseURL, firstNonEmpty(oldProfile.Runtime, previous.ManagedSession.Runtime), firstNonEmpty(oldProfile.Model, previous.ManagedSession.Model))
 	if err != nil {
 		return botletsCredentialProfileRenameRepair{}, false, err
 	}

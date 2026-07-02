@@ -219,7 +219,7 @@ func prepareBotletsCredentialProfileRenameRepair(paths Paths, botletsHome string
 	if !strings.EqualFold(oldProfile.Handle, previous.Handle) {
 		return botletsRepairCredentialProfileRename{}, false, nil
 	}
-	profileWrite, err := prepareBotletsAgentProfileForRepair(paths, candidate.Handle, oldProfile.AgentSecret, oldProfile.BaseURL, firstNonEmptyForRepair(oldProfile.Runtime, previous.ManagedSession.Runtime))
+	profileWrite, err := prepareBotletsAgentProfileForRepair(paths, candidate.Handle, oldProfile.AgentSecret, oldProfile.BaseURL, firstNonEmptyForRepair(oldProfile.Runtime, previous.ManagedSession.Runtime), firstNonEmptyForRepair(oldProfile.Model, previous.ManagedSession.Model))
 	if err != nil {
 		return botletsRepairCredentialProfileRename{}, false, err
 	}
@@ -242,7 +242,7 @@ func prepareBotletsCredentialProfileRenameRepair(paths Paths, botletsHome string
 	return botletsRepairCredentialProfileRename{entry: candidate, profileWrite: profileWrite, writeCanonical: writeCanonical, aliasWrites: aliasWrites}, true, nil
 }
 
-func prepareBotletsAgentProfileForRepair(paths Paths, handle string, agentSecret string, baseURL string, runtime string) (botletsRepairAgentProfileWrite, error) {
+func prepareBotletsAgentProfileForRepair(paths Paths, handle string, agentSecret string, baseURL string, runtime string, model string) (botletsRepairAgentProfileWrite, error) {
 	if handle == "" || agentSecret == "" {
 		return botletsRepairAgentProfileWrite{}, errors.New("missing Botlets agent credential")
 	}
@@ -252,6 +252,10 @@ func prepareBotletsAgentProfileForRepair(paths Paths, handle string, agentSecret
 	runtime = strings.TrimSpace(runtime)
 	if runtime != "" && runtime != "claude" && runtime != "codex" {
 		return botletsRepairAgentProfileWrite{}, errors.New("invalid Botlets runtime")
+	}
+	model, ok := normalizeAgentModel(model)
+	if !ok {
+		return botletsRepairAgentProfileWrite{}, errors.New("invalid Botlets model")
 	}
 	profilePath, err := ValidateAgentProfileWriteTarget(paths, handle)
 	if err != nil {
@@ -264,6 +268,9 @@ func prepareBotletsAgentProfileForRepair(paths Paths, handle string, agentSecret
 	}
 	if runtime != "" {
 		profileData["runtime"] = runtime
+	}
+	if model != "" {
+		profileData["model"] = model
 	}
 	data, err := json.MarshalIndent(profileData, "", "  ")
 	if err != nil {
@@ -280,6 +287,7 @@ func prepareBotletsAgentProfileForRepair(paths Paths, handle string, agentSecret
 			AgentSecret: agentSecret,
 			BaseURL:     strings.TrimSuffix(baseURL, "/"),
 			Runtime:     runtime,
+			Model:       model,
 			Path:        profilePath,
 		},
 	}, nil

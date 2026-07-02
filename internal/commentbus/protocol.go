@@ -572,7 +572,7 @@ func validateSessionRegisterParams(params map[string]any) error {
 }
 
 func validateSessionStartParams(params map[string]any) error {
-	if err := exactParams(params, "bot", "profile", "scope_type", "scope_id", "expected_runtime"); err != nil {
+	if err := exactParams(params, "bot", "profile", "scope_type", "scope_id", "expected_runtime", "expected_model", "requested_model", "requested_model_set"); err != nil {
 		return err
 	}
 	if err := validateOptionalBotProfile(params); err != nil {
@@ -582,6 +582,29 @@ func validateSessionStartParams(params map[string]any) error {
 		value, ok := expectedRuntime.(string)
 		if !ok || !isManagedSessionRuntime(value) {
 			return errors.New("invalid expected_runtime")
+		}
+	}
+	if expectedModel, ok := params["expected_model"]; ok {
+		value, ok := expectedModel.(string)
+		model, valid := normalizeAgentModel(value)
+		if !ok || !valid || model != value || model == "" {
+			return errors.New("invalid expected_model")
+		}
+	}
+	requestedModel, hasRequestedModel := params["requested_model"]
+	requestedModelSet, hasRequestedModelSet := params["requested_model_set"]
+	if hasRequestedModel || hasRequestedModelSet {
+		value, ok := requestedModel.(string)
+		if !hasRequestedModel || !ok {
+			return errors.New("invalid requested_model")
+		}
+		set, ok := requestedModelSet.(bool)
+		if !hasRequestedModelSet || !ok || !set {
+			return errors.New("invalid requested_model_set")
+		}
+		model, valid := normalizeAgentModel(value)
+		if !valid || model != value {
+			return errors.New("invalid requested_model")
 		}
 	}
 	_, hasType := params["scope_type"]

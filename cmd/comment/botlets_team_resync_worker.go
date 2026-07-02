@@ -306,6 +306,7 @@ func botletsRegistryHandles(botletsHome string) (map[string]bool, bool) {
 // changes server-side while its handle stays the same.
 type botletsRegistryInstalledState struct {
 	Runtime            string
+	Model              string
 	Timezone           string
 	RespondsToMentions bool
 	WorkspaceID        string
@@ -331,6 +332,7 @@ func botletsRegistryEntries(botletsHome string) (map[string]botletsRegistryInsta
 			Handle         string `json:"handle"`
 			ManagedSession struct {
 				Runtime  string `json:"runtime"`
+				Model    string `json:"model"`
 				Timezone string `json:"timezone"`
 			} `json:"managed_session"`
 			RespondsToMentions bool `json:"responds_to_mentions"`
@@ -351,6 +353,7 @@ func botletsRegistryEntries(botletsHome string) (map[string]botletsRegistryInsta
 	for _, bot := range registry.Bots {
 		state := botletsRegistryInstalledState{
 			Runtime:            bot.ManagedSession.Runtime,
+			Model:              bot.ManagedSession.Model,
 			Timezone:           bot.ManagedSession.Timezone,
 			RespondsToMentions: bot.RespondsToMentions,
 		}
@@ -367,24 +370,24 @@ func botletsRegistryEntries(botletsHome string) (map[string]botletsRegistryInsta
 	return entries, true
 }
 
-// agentProfileRuntime reads back the persisted runtime from a generic agent
+// agentProfileRuntimeAndModel reads back the persisted runtime/model from a generic agent
 // profile file (<home>/agents/<handle>.json). The second return is false when
 // the file cannot be read or parsed (the caller treats an unreadable profile as
-// indeterminate rather than a runtime mismatch). An empty runtime is normal: the
-// profile writer omits the field when no runtime was selected and the launcher
-// falls back to claude.
-func agentProfileRuntime(path string) (string, bool) {
+// indeterminate rather than a mismatch). Empty values are normal: the profile
+// writer omits fields when no runtime/model was selected.
+func agentProfileRuntimeAndModel(path string) (string, string, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	var profile struct {
 		Runtime string `json:"runtime"`
+		Model   string `json:"model"`
 	}
 	if json.Unmarshal(data, &profile) != nil {
-		return "", false
+		return "", "", false
 	}
-	return profile.Runtime, true
+	return profile.Runtime, profile.Model, true
 }
 
 // agentProfileCredentialed reports whether a generic agent profile file carries
