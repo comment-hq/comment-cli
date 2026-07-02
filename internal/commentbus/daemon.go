@@ -102,6 +102,23 @@ type DaemonOptions struct {
 	// package main (launchAgentRuntimeDetached), so it is injected here rather
 	// than imported by package commentbus.
 	MentionAutoStart func(ctx context.Context, paths Paths, handle string) error
+	// SocketWatchdogInterval is how often the running daemon re-checks that its
+	// Unix listening socket still exists and is the file it bound, re-binding it
+	// if it vanished. 0 uses defaultSocketWatchdogInterval; a negative value
+	// disables the watchdog (tests use this to demonstrate the pre-fix wedge); a
+	// positive value sets a fast interval to exercise recovery. Ignored for a
+	// TCP-only daemon (no Unix socket to watch).
+	SocketWatchdogInterval time.Duration
+	// StartupInitTimeout bounds the store/capability init that runs after the
+	// singleton lock is acquired but before the socket is bound. <=0 uses
+	// defaultStartupInitTimeout. On timeout StartDaemon fails and releases the
+	// lock rather than wedging alive-but-socketless.
+	StartupInitTimeout time.Duration
+	// SocketRebindTimeout bounds a watchdog re-bind (net.ListenUnix/chmod/lstat,
+	// none context-cancellable). <=0 uses defaultSocketRebindTimeout. It caps how
+	// long Close can wait to join a watchdog stuck re-binding on a wedged
+	// filesystem. Tests set a small value.
+	SocketRebindTimeout time.Duration
 }
 
 type NotificationPollerStatus struct {
@@ -179,8 +196,20 @@ type Daemon struct {
 	botletsHome           string
 	defaultBaseURL        string
 	logger                *structuredLogger
-	socketFileInfo        os.FileInfo
-	pidFileInfo           os.FileInfo
+	// socketMu guards listener and socketFileInfo, which the socket watchdog
+	// swaps under it when it re-binds a vanished socket, and which Close snapshots
+	// under it so teardown closes/removes the current listener and socket file.
+	socketMu               sync.Mutex
+	socketWatchdogInterval time.Duration
+	socketRebindTimeout    time.Duration
+	// socketWatchdogDone is closed when the socket-watchdog goroutine exits, so
+	// Close can join it (like the transient-runtime / notification-poller
+	// teardown) before tearing down store/logger/socket — an in-flight re-bind
+	// must not touch that state after Close declares cleanup done. nil when no
+	// watchdog was started (TCP-only daemon).
+	socketWatchdogDone chan struct{}
+	socketFileInfo     os.FileInfo
+	pidFileInfo        os.FileInfo
 	// baseCtx is the daemon's long-lived context (the daemonCtx StartDaemon derives
 	// from the caller's ctx). It outlives any per-request/per-ingest context and is
 	// cancelled only when the daemon shuts down (shutdownCancel). Detached work that
@@ -294,18 +323,51 @@ func StartDaemon(ctx context.Context, options DaemonOptions) (*Daemon, error) {
 		}
 	}()
 
-	store, err := OpenStore(ctx, paths)
-	if err != nil {
-		return nil, err
+	// Bound the post-lock / pre-listen init (store open + capability ensure) with
+	// a startup timeout. These run while the singleton lock is held but before the
+	// socket is bound, so a hang here (e.g. a wedged bind-mount filesystem) would
+	// otherwise strand the lock with no socket — a live-but-unreachable daemon no
+	// client can dial and no fresh StartDaemon can replace. On timeout we return
+	// an error and the deferred lockFile.Close() (lockOwned still false) releases
+	// the lock for a clean restart.
+	startupTimeout := options.StartupInitTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = defaultStartupInitTimeout
 	}
-	logger, err := newStructuredLogger(paths, options.LogWriter, now)
-	if err != nil {
-		_ = store.Close()
-		return nil, err
-	}
-	if _, err := EnsureOwnerCapability(paths); err != nil {
-		_ = logger.close()
-		_ = store.Close()
+	var store *Store
+	var logger *structuredLogger
+	if err := runWithStartupTimeout(startupTimeout, func() error {
+		runStartupInitProbe()
+		s, err := OpenStore(ctx, paths)
+		if err != nil {
+			return err
+		}
+		lg, err := newStructuredLogger(paths, options.LogWriter, now)
+		if err != nil {
+			_ = s.Close()
+			return err
+		}
+		if _, err := EnsureOwnerCapability(paths); err != nil {
+			_ = lg.close()
+			_ = s.Close()
+			return err
+		}
+		store = s
+		logger = lg
+		return nil
+	}, func() {
+		// Late success: the init finished only after the timeout already made
+		// StartDaemon return, so nothing will ever use these handles. Close them so
+		// a merely-slow (not permanently wedged) init doesn't leak a SQLite/log fd.
+		// Safe to read store/logger here: the done-channel receive in
+		// runWithStartupTimeout happens-after fn's assignments to them.
+		if store != nil {
+			_ = store.Close()
+		}
+		if logger != nil {
+			_ = logger.close()
+		}
+	}); err != nil {
 		return nil, err
 	}
 	// The Unix listener can be disabled (TCP-only). This is required when the
@@ -316,24 +378,10 @@ func StartDaemon(ctx context.Context, options DaemonOptions) (*Daemon, error) {
 	var listener *net.UnixListener
 	var socketFileInfo os.FileInfo
 	if !options.DisableUnixListener {
-		l, err := net.ListenUnix("unix", &net.UnixAddr{Name: paths.Socket, Net: "unix"})
+		l, info, err := bindUnixSocket(paths.Socket)
 		if err != nil {
 			_ = logger.close()
 			_ = store.Close()
-			return nil, err
-		}
-		if err := os.Chmod(paths.Socket, 0o600); err != nil {
-			_ = logger.close()
-			_ = l.Close()
-			_ = store.Close()
-			return nil, err
-		}
-		info, err := os.Lstat(paths.Socket)
-		if err != nil {
-			_ = logger.close()
-			_ = l.Close()
-			_ = store.Close()
-			_ = os.Remove(paths.Socket)
 			return nil, err
 		}
 		listener = l
@@ -393,6 +441,8 @@ func StartDaemon(ctx context.Context, options DaemonOptions) (*Daemon, error) {
 		defaultBaseURL:               options.DefaultBaseURL,
 		logger:                       logger,
 		socketFileInfo:               socketFileInfo,
+		socketWatchdogInterval:       options.SocketWatchdogInterval,
+		socketRebindTimeout:          options.SocketRebindTimeout,
 		pidFileInfo:                  pidFileInfo,
 		baseCtx:                      daemonCtx,
 		shutdownCancel:               shutdownCancel,
@@ -435,6 +485,12 @@ func StartDaemon(ctx context.Context, options DaemonOptions) (*Daemon, error) {
 	daemon.activateNotificationPollers()
 	if daemon.listener != nil {
 		go daemon.serveListener(daemon.listener)
+		// Watch the Unix socket for disappearance and re-bind it in place, so the
+		// daemon can't wedge alive-but-socketless (lock held, no socket) — a state
+		// that was previously unrecoverable without killing the process. Close
+		// joins socketWatchdogDone so an in-flight re-bind finishes before teardown.
+		daemon.socketWatchdogDone = make(chan struct{})
+		go daemon.runSocketWatchdog(daemonCtx)
 	}
 	if daemon.tcpListener != nil {
 		go daemon.serveListener(daemon.tcpListener)
@@ -462,10 +518,25 @@ func (d *Daemon) Close() error {
 		if d.shutdownCancel != nil {
 			d.shutdownCancel()
 		}
+		// Join the socket watchdog before touching store/logger/socket below: an
+		// in-flight re-bind (blocked in bindUnixSocket) must not log to a closed
+		// logger or install a socket after teardown. Mirrors the join-before-
+		// teardown pattern used for transient runtimes and notification pollers.
+		if d.socketWatchdogDone != nil {
+			<-d.socketWatchdogDone
+		}
 		d.stopAllTransientRuntimes()
 		d.stopAllNotificationPollers()
-		if d.listener != nil {
-			d.closeErr = errors.Join(d.closeErr, d.listener.Close())
+		// Snapshot the Unix listener + socket identity under socketMu: the watchdog
+		// may swap them concurrently when it re-binds. shutdownCancel above has
+		// already fired, so any in-flight watchdog re-bind sees ctx cancelled under
+		// this same lock and won't install a listener after we snapshot.
+		d.socketMu.Lock()
+		unixListener := d.listener
+		socketFileInfo := d.socketFileInfo
+		d.socketMu.Unlock()
+		if unixListener != nil {
+			d.closeErr = errors.Join(d.closeErr, unixListener.Close())
 		}
 		if d.tcpListener != nil {
 			d.closeErr = errors.Join(d.closeErr, d.tcpListener.Close())
@@ -476,7 +547,7 @@ func (d *Daemon) Close() error {
 		if d.logger != nil {
 			d.closeErr = errors.Join(d.closeErr, d.logger.close())
 		}
-		d.closeErr = errors.Join(d.closeErr, removeIfSameFile(d.paths.Socket, d.socketFileInfo))
+		d.closeErr = errors.Join(d.closeErr, removeIfSameFile(d.paths.Socket, socketFileInfo))
 		d.closeErr = errors.Join(d.closeErr, removeIfSameFile(d.paths.PID, d.pidFileInfo))
 		// Release the singleton lock LAST — after the store is closed and the
 		// socket/PID are removed — so a concurrent restart can't acquire the lock
@@ -1268,11 +1339,48 @@ func isLoopbackTCPAddr(addr string) bool {
 }
 
 func (d *Daemon) serveListener(l net.Listener) {
+	const (
+		acceptBackoffStart = 5 * time.Millisecond
+		acceptBackoffMax   = time.Second
+	)
+	ctx := d.baseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var backoff time.Duration
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			// A transient accept error (e.g. EMFILE/ENFILE under fd exhaustion)
+			// must not kill the accept loop: a dead loop leaves the socket file on
+			// disk but unserved — a wedge the file-identity watchdog can't see. Back
+			// off and keep serving. A permanent error means the listener was closed
+			// (shutdown or watchdog re-bind), so we exit.
+			if isTransientAcceptError(err) {
+				if backoff == 0 {
+					backoff = acceptBackoffStart
+				} else if backoff < acceptBackoffMax {
+					backoff *= 2
+					if backoff > acceptBackoffMax {
+						backoff = acceptBackoffMax
+					}
+				}
+				d.logger.warn("bus.accept_transient_error", map[string]any{
+					"error":      err.Error(),
+					"backoff_ms": backoff.Milliseconds(),
+				})
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
 			return
 		}
+		backoff = 0
 		go d.handleConn(conn)
 	}
 }

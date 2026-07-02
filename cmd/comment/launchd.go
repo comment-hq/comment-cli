@@ -485,15 +485,19 @@ func runBusStatus(args []string) error {
 		if err != nil {
 			return err
 		}
+		socketLive := daemonSocketLive(paths)
+		message := busStatusLivenessMessage(unsupportedPersistentServiceMessage("status"), false, socketLive)
 		return printJSON(map[string]any{
 			"ok":           true,
 			"supported":    false,
 			"installed":    false,
 			"loaded":       false,
+			"socket_live":  socketLive,
+			"running":      socketLive,
 			"home":         paths.Home,
 			"socket_path":  paths.Socket,
 			"history_path": paths.History,
-			"message":      unsupportedPersistentServiceMessage("status"),
+			"message":      message,
 		})
 	}
 	paths, cfg, err := newLaunchAgentConfig(*home, "", "")
@@ -508,10 +512,14 @@ func runBusStatus(args []string) error {
 			return err
 		}
 	}
+	socketLive := daemonSocketLive(paths)
 	return printJSON(launchdResult(paths, cfg, map[string]any{
-		"supported": launchdSupported(),
-		"installed": installed,
-		"loaded":    loaded,
+		"supported":   launchdSupported(),
+		"installed":   installed,
+		"loaded":      loaded,
+		"socket_live": socketLive,
+		"running":     loaded || socketLive,
+		"message":     busStatusLivenessMessage("", loaded, socketLive),
 	}))
 }
 
@@ -995,6 +1003,45 @@ func runBusStopSystemd(home string) error {
 	}))
 }
 
+// busStatusSocketProbeTimeout bounds the health probe `comment bus status` makes
+// to decide whether the daemon is actually reachable, independent of what the
+// service manager reports.
+const busStatusSocketProbeTimeout = 750 * time.Millisecond
+
+// daemonSocketLive reports whether a daemon is actually answering on the bus
+// socket. This is the ground truth for "is it running": the service-manager
+// check (launchctl / systemctl is-active) is a false negative when no service
+// manager is present — e.g. a systemd-less container, where the daemon runs as a
+// plain foreground `comment bus run` that systemd knows nothing about. The health
+// op is unauthenticated, so a nil auth is fine.
+func daemonSocketLive(paths commentbus.Paths) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), busStatusSocketProbeTimeout)
+	defer cancel()
+	response, err := callSocket(ctx, paths, "health", nil, nil, busStatusSocketProbeTimeout)
+	if err != nil {
+		return false
+	}
+	return response.OK
+}
+
+// busStatusLivenessMessage returns the `message` a `bus status` result should
+// report, appending an explanation when the daemon is running *only* because the
+// socket probe reached it — i.e. the service manager reports it not loaded, or
+// couldn't answer at all. `base` is any pre-existing message (e.g. a systemctl
+// error) to preserve. Shared by all three status paths so the explanatory
+// contract stays identical across systemd, launchd, and the no-service-manager
+// fallback.
+func busStatusLivenessMessage(base string, loaded, socketLive bool) string {
+	if !socketLive || loaded {
+		return base
+	}
+	note := "the daemon is reachable on the bus socket (socket probe), so it is running"
+	if base == "" {
+		return note
+	}
+	return strings.TrimSpace(base + "; " + note)
+}
+
 func runBusStatusSystemd(home string) error {
 	paths, cfg, err := newSystemdServiceConfig(home, "", "")
 	if err != nil {
@@ -1009,11 +1056,17 @@ func runBusStatusSystemd(home string) error {
 		supported = false
 		message = err.Error()
 	}
+	// Probe the socket directly: a systemd-less container answers here even when
+	// is-active can't run, so it — not the service manager — is the source of
+	// truth for whether the daemon is running.
+	socketLive := daemonSocketLive(paths)
 	return printJSON(systemdResult(paths, cfg, map[string]any{
-		"supported": supported,
-		"installed": fileExists(cfg.UnitPath),
-		"loaded":    loaded,
-		"message":   message,
+		"supported":   supported,
+		"installed":   fileExists(cfg.UnitPath),
+		"loaded":      loaded,
+		"socket_live": socketLive,
+		"running":     loaded || socketLive,
+		"message":     busStatusLivenessMessage(message, loaded, socketLive),
 	}))
 }
 

@@ -190,6 +190,24 @@ func (w *botletsTeamInstallWorker) installOne(ctx context.Context, auth commentb
 			errMsg = rerr.Error()
 		}
 		w.logWarn("team_install.redeem_failed", map[string]any{"request_id": item.RequestID, "status": status, "error": errMsg})
+		// The redeem route consumes the request (pending -> redeemed) BEFORE it
+		// provisions the workspace runner, and consume is idempotent on the same
+		// idempotency key. On a RETRYABLE failure (transport error, a 5xx while
+		// runner provisioning is flaky, or a rate-limit) leave the request unacked:
+		// it stays 'redeemed', the daemon poll re-returns it (the list returns
+		// pending AND redeemed), and the next tick re-redeems with the same key and
+		// recovers. Acking 'failed' on a momentary blip would flip it terminal and
+		// permanently break that recovery, failing the browser install.
+		if teamInstallRedeemRetryable(status, rerr) {
+			return
+		}
+		// TERMINAL failure (a 4xx such as stale / cancelled / expired /
+		// daemon-mismatch, or a 200 carrying no runner): retrying can never
+		// succeed. The owner DO's sweep expires only 'pending' requests, so a
+		// consumed-then-terminally-failed request left unacked would be re-redeemed
+		// every poll forever and the browser would hang on "Installing…". Ack
+		// 'failed' so the request reaches a terminal state and the browser falls
+		// back to the setup command.
 		w.ack(ctx, auth, item.RequestID, "failed", "REDEEM_FAILED", errMsg)
 		return
 	}
@@ -224,6 +242,22 @@ func (w *botletsTeamInstallWorker) installOne(ctx context.Context, auth commentb
 		"workspace_id": cfg.WorkspaceID,
 		"runner_id":    cfg.RunnerID,
 	})
+}
+
+// teamInstallRedeemRetryable reports whether a failed redeem should be left
+// unacked for the daemon poll to retry, rather than acked terminally. A transport
+// error (doDaemonJSON returns status 0) or a decode error on a 2xx body (a
+// truncated success) recovers on the next idempotent re-redeem, as does a 5xx
+// (the workspace-runner mint flaking) or a 429 rate-limit. Every other non-200 —
+// a 4xx client/terminal error (stale, cancelled, expired, daemon-mismatch,
+// consumed-by-another-key) or a malformed 200 with no runner — is terminal and
+// must be acked 'failed' so the request leaves the 'redeemed' state (which the
+// owner DO's sweep never expires) instead of being re-redeemed forever.
+func teamInstallRedeemRetryable(status int, err error) bool {
+	if err != nil {
+		return true
+	}
+	return status >= 500 || status == http.StatusTooManyRequests
 }
 
 func (w *botletsTeamInstallWorker) ack(ctx context.Context, auth commentbus.DaemonAuth, requestID, state, code, message string) {
