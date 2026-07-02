@@ -1841,6 +1841,77 @@ func TestDaemonBmuxRecoverAdoptsAliveRuntime(t *testing.T) {
 	}
 }
 
+func TestDaemonBmuxStatusDoesNotRelaunchDeadRuntime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture := startBmuxClaudeDaemonFixture(t, ctx)
+	record := fixture.startManagedSession(t)
+
+	fixture.bmux.mu.Lock()
+	fixture.bmux.deadChildren[record.SessionName] = true
+	fixture.bmux.mu.Unlock()
+
+	startedAt := time.Now()
+	status, statusErr := fixture.daemon.sessionStatus(SocketRequest{Params: map[string]any{"session_id": record.SessionID}})
+	if statusErr != nil {
+		t.Fatalf("status error = %+v", statusErr)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("status took %s, want no inline bmux relaunch wait", elapsed)
+	}
+	if len(status) != 1 || status[0].State != "stale" {
+		t.Fatalf("status records = %+v, want stale dead bmux session", status)
+	}
+	fixture.bmux.mu.Lock()
+	defer fixture.bmux.mu.Unlock()
+	if len(fixture.bmux.starts) != 1 {
+		t.Fatalf("bmux starts = %d, want no status relaunch", len(fixture.bmux.starts))
+	}
+}
+
+func TestDaemonBmuxRelaunchPersistsFreshStartupAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture := startBmuxClaudeDaemonFixture(t, ctx)
+	record := fixture.startManagedSession(t)
+	record.CreatedAt = busTime(time.Now().Add(-10 * time.Minute))
+	if err := WriteSessionRecord(fixture.paths, record); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.bmux.mu.Lock()
+	fixture.bmux.deadChildren[record.SessionName] = true
+	fixture.bmux.newSessionErr = errors.New("fake bmux relaunch failed")
+	fixture.bmux.mu.Unlock()
+
+	before := time.Now().UTC()
+	fixture.daemon.sessionMu.Lock()
+	_, syncErr := fixture.daemon.syncSessionLivenessLocked(record)
+	fixture.daemon.sessionMu.Unlock()
+	if syncErr == nil {
+		t.Fatal("syncSessionLivenessLocked succeeded; want relaunch failure")
+	}
+
+	after, err := ReadSessionRecord(fixture.paths, record.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.StartupStartedAt == "" {
+		t.Fatalf("startup_started_at was not persisted during relaunch: %+v", after)
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, after.StartupStartedAt)
+	if err != nil {
+		t.Fatalf("startup_started_at %q did not parse: %v", after.StartupStartedAt, err)
+	}
+	if startedAt.Before(before.Add(-time.Second)) {
+		t.Fatalf("startup_started_at = %s, want a fresh relaunch time after %s", startedAt, before)
+	}
+	remaining := managedSessionStartupRemaining(after, before)
+	if remaining <= 0 {
+		t.Fatalf("startup remaining = %s, want fresh relaunch window despite old created_at %s", remaining, after.CreatedAt)
+	}
+}
+
 func TestDaemonBmuxRecoverDeadRuntimeRelaunchesWithClaudeResumeAndNudges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -5353,7 +5424,7 @@ func TestDaemonStartingSessionRecoveryRequiresRuntimeCommand(t *testing.T) {
 		PaneTarget:  paneTarget,
 		Runtime:     "claude",
 		State:       "starting",
-		Now:         time.Now().UTC(),
+		Now:         time.Now().Add(-managedSessionRuntimeStartupTimeout - time.Second).UTC(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -5373,6 +5444,7 @@ func TestDaemonStartingSessionRecoveryRequiresRuntimeCommand(t *testing.T) {
 	tmux.paneCommands[paneTarget] = "zsh"
 	tmux.mu.Unlock()
 
+	startedAt := time.Now()
 	start := requestDaemon(t, paths, map[string]any{
 		"id": "req_startingrecoverruntime",
 		"op": "sessions.start",
@@ -5384,6 +5456,9 @@ func TestDaemonStartingSessionRecoveryRequiresRuntimeCommand(t *testing.T) {
 	})
 	if !start.OK {
 		t.Fatalf("replacement start after stuck starting session failed: %+v", start.Error)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+		t.Fatalf("replacement start after expired starting session took %s, want no fresh startup wait", elapsed)
 	}
 	replacementID := start.Result.(map[string]any)["session"].(map[string]any)["session_id"].(string)
 	if replacementID == record.SessionID {
@@ -5521,6 +5596,330 @@ func TestDaemonSessionStartPersistsPaneTargetBeforeRuntimeWait(t *testing.T) {
 	// Shell-mode managed sessions pin no runtime path.
 	if record.RuntimeLaunchMode != RuntimeLaunchModeShell || record.RuntimePath != "" || record.State != "alive" {
 		t.Fatalf("started session record = %+v", record)
+	}
+}
+
+func TestDaemonSessionStartRetriesTransientForegroundInspectFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	capability := loadMessageTestBots(t, paths)
+	tmux := daemon.tmux.(*testTmuxController)
+	_ = prependFakeRuntime(t, "claude")
+
+	var attempts atomic.Int32
+	tmux.beforePaneCurrentCommand = func(paneTarget string) {
+		attempt := attempts.Add(1)
+		tmux.mu.Lock()
+		defer tmux.mu.Unlock()
+		if attempt <= 3 {
+			tmux.failPaneCommand[paneTarget] = true
+			return
+		}
+		tmux.failPaneCommand[paneTarget] = false
+		tmux.paneCommands[paneTarget] = "claude"
+	}
+
+	start := requestDaemon(t, paths, map[string]any{
+		"id": "req_startretryinspect",
+		"op": "sessions.start",
+		"auth": map[string]any{
+			"mode":       "owner",
+			"capability": capability,
+		},
+		"params": map[string]any{"bot": "reviewer"},
+	})
+	if !start.OK {
+		t.Fatalf("start failed after transient foreground inspect failures: %+v", start.Error)
+	}
+	if got := attempts.Load(); got < 4 {
+		t.Fatalf("foreground inspect attempts = %d, want retries before success", got)
+	}
+	if len(tmux.kills) != 0 {
+		t.Fatalf("transient foreground inspect failures killed session(s): %#v", tmux.kills)
+	}
+	session := start.Result.(map[string]any)["session"].(map[string]any)
+	if session["state"] != "alive" {
+		t.Fatalf("session state = %#v, want alive", session)
+	}
+}
+
+func TestDaemonWaitForSessionRuntimeRetriesInspectFailuresUntilTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	tmux := daemon.tmux.(*testTmuxController)
+
+	sessionName := "comment-reviewer-retrytimeout"
+	paneTarget := sessionName + ":0.0"
+	record := SessionRecord{
+		Profile:           "max.reviewer",
+		BotName:           "reviewer",
+		SessionName:       sessionName,
+		PaneTarget:        paneTarget,
+		Runtime:           "claude",
+		RuntimeCommand:    []string{"claude", "--dangerously-skip-permissions"},
+		RuntimeLaunchMode: RuntimeLaunchModeShell,
+		State:             "starting",
+	}
+	tmux.mu.Lock()
+	tmux.setActivePaneLocked(sessionName, paneTarget)
+	tmux.failPaneCommand[paneTarget] = true
+	tmux.mu.Unlock()
+
+	var attempts atomic.Int32
+	tmux.beforePaneCurrentCommand = func(_ string) {
+		attempts.Add(1)
+	}
+
+	runtimeErr := daemon.waitForSessionRuntimeLockedWithContext(ctx, record, 125*time.Millisecond)
+	if runtimeErr == nil || runtimeErr.Code != "UPSTREAM_ERROR" || runtimeErr.Message != "could not inspect session foreground command" {
+		t.Fatalf("runtime error = %+v, want foreground inspect failure after retry window", runtimeErr)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("foreground inspect attempts = %d, want retry until timeout", got)
+	}
+}
+
+func TestDaemonWaitForSessionRuntimeDoesNotRetryMissingPane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	tmux := daemon.tmux.(*testTmuxController)
+
+	record := SessionRecord{
+		Profile:           "max.reviewer",
+		BotName:           "reviewer",
+		SessionName:       "comment-reviewer-missingpane",
+		PaneTarget:        "comment-reviewer-missingpane:0.0",
+		Runtime:           "claude",
+		RuntimeCommand:    []string{"claude", "--dangerously-skip-permissions"},
+		RuntimeLaunchMode: RuntimeLaunchModeShell,
+		State:             "starting",
+	}
+
+	var attempts atomic.Int32
+	tmux.beforePaneCurrentCommand = func(_ string) {
+		attempts.Add(1)
+	}
+
+	start := time.Now()
+	runtimeErr := daemon.waitForSessionRuntimeLockedWithContext(ctx, record, 5*time.Second)
+	if runtimeErr == nil || runtimeErr.Code != "CONFLICT" || runtimeErr.Message != "session is not running" {
+		t.Fatalf("runtime error = %+v, want immediate missing-session conflict", runtimeErr)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("foreground inspect attempts = %d, want one missing-pane check", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("missing pane returned after %s, want no startup-timeout retry", elapsed)
+	}
+}
+
+func TestManagedSessionRuntimeStartupTimeoutAllowsSlowBotlets(t *testing.T) {
+	if managedSessionRuntimeStartupTimeout != time.Minute {
+		t.Fatalf("managed session startup timeout = %s, want 1m", managedSessionRuntimeStartupTimeout)
+	}
+	if sessionRuntimeStartupTimeout >= managedSessionRuntimeStartupTimeout {
+		t.Fatalf("transient runtime startup timeout %s should stay shorter than managed timeout %s", sessionRuntimeStartupTimeout, managedSessionRuntimeStartupTimeout)
+	}
+}
+
+func TestManagedSessionStartupRemainingUsesStartupAttemptTime(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	record := SessionRecord{
+		CreatedAt:        busTime(now.Add(-10 * time.Minute)),
+		StartupStartedAt: busTime(now.Add(-10 * time.Second)),
+	}
+
+	remaining := managedSessionStartupRemaining(record, now)
+	want := managedSessionRuntimeStartupTimeout - 10*time.Second
+	if remaining != want {
+		t.Fatalf("startup remaining = %s, want %s", remaining, want)
+	}
+}
+
+func TestDaemonStartingSessionRecoveryUsesManagedStartupTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	tmux := daemon.tmux.(*testTmuxController)
+
+	sessionName := "comment-reviewer-slowrecovery"
+	paneTarget := sessionName + ":0.0"
+	record := SessionRecord{
+		Profile:           "max.reviewer",
+		BotName:           "reviewer",
+		SessionName:       sessionName,
+		PaneTarget:        paneTarget,
+		Runtime:           "claude",
+		RuntimeCommand:    []string{"claude", "--dangerously-skip-permissions"},
+		RuntimeLaunchMode: RuntimeLaunchModeShell,
+		State:             "starting",
+	}
+
+	commands := make([]string, 0, 50)
+	for i := 0; i < 45; i++ {
+		commands = append(commands, "zsh")
+	}
+	commands = append(commands, "claude")
+	tmux.mu.Lock()
+	tmux.setActivePaneLocked(sessionName, paneTarget)
+	tmux.paneCommandSequences[paneTarget] = commands
+	tmux.mu.Unlock()
+
+	startedAt := time.Now()
+	reason, runtimeErr := daemon.sessionRuntimeIssueLocked(record, true)
+	if runtimeErr != nil {
+		t.Fatalf("runtime issue error = %+v", runtimeErr)
+	}
+	if reason != "" {
+		t.Fatalf("runtime issue reason = %q, want no stale reason", reason)
+	}
+	if elapsed := time.Since(startedAt); elapsed <= sessionRuntimeStartupTimeout {
+		t.Fatalf("recovery returned after %s, want it to wait past old startup timeout %s", elapsed, sessionRuntimeStartupTimeout)
+	}
+}
+
+func TestDaemonSessionStatusDoesNotWaitForSlowStartingRuntime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	loadMessageTestBots(t, paths)
+	tmux := daemon.tmux.(*testTmuxController)
+
+	sessionID, err := GenerateLocalID("sess", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := GenerateLocalID("gen", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionName, err := tmuxSessionName("reviewer", sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paneTarget := sessionName + ":0.0"
+	record, err := RegisterSession(RegisterSessionOptions{
+		Paths:       paths,
+		Profile:     "max.reviewer",
+		BotName:     "reviewer",
+		ScopeType:   "profile",
+		ScopeID:     "max.reviewer",
+		SessionID:   sessionID,
+		Generation:  generation,
+		BotletsHome: filepath.Join(paths.Home, "botlets"),
+		SessionName: sessionName,
+		PaneTarget:  paneTarget,
+		Runtime:     "claude",
+		State:       "starting",
+		Now:         time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmux.mu.Lock()
+	tmux.setActivePaneLocked(sessionName, paneTarget)
+	tmux.paneCommands[paneTarget] = "zsh"
+	tmux.mu.Unlock()
+
+	type statusResult struct {
+		records []SessionRecord
+		err     *SocketError
+	}
+	done := make(chan statusResult, 1)
+	go func() {
+		records, statusErr := daemon.sessionStatus(SocketRequest{Params: map[string]any{"session_id": record.SessionID}})
+		done <- statusResult{records: records, err: statusErr}
+	}()
+
+	var result statusResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("session status blocked for slow starting runtime; want nonblocking status")
+	}
+	if result.err != nil {
+		t.Fatalf("status error = %+v", result.err)
+	}
+	if len(result.records) != 1 || result.records[0].State != "starting" {
+		t.Fatalf("status records = %+v, want one starting session", result.records)
+	}
+	recordAfter, err := ReadSessionRecord(paths, record.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordAfter.State != "starting" {
+		t.Fatalf("stored session state = %q, want starting", recordAfter.State)
+	}
+}
+
+func TestDaemonSessionStatusMarksExpiredStartingRuntimeStale(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	paths, daemon := startTestDaemon(t, ctx, nil)
+	defer daemon.Close()
+	tmux := daemon.tmux.(*testTmuxController)
+
+	sessionID, err := GenerateLocalID("sess", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := GenerateLocalID("gen", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionName, err := tmuxSessionName("reviewer", sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paneTarget := sessionName + ":0.0"
+	record, err := RegisterSession(RegisterSessionOptions{
+		Paths:       paths,
+		Profile:     "max.reviewer",
+		BotName:     "reviewer",
+		ScopeType:   "profile",
+		ScopeID:     "max.reviewer",
+		SessionID:   sessionID,
+		Generation:  generation,
+		BotletsHome: filepath.Join(paths.Home, "botlets"),
+		SessionName: sessionName,
+		PaneTarget:  paneTarget,
+		Runtime:     "claude",
+		State:       "starting",
+		Now:         time.Now().Add(-managedSessionRuntimeStartupTimeout - time.Second).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmux.mu.Lock()
+	tmux.setActivePaneLocked(sessionName, paneTarget)
+	tmux.paneCommands[paneTarget] = "zsh"
+	tmux.mu.Unlock()
+
+	startedAt := time.Now()
+	status, statusErr := daemon.sessionStatus(SocketRequest{Params: map[string]any{"session_id": record.SessionID}})
+	if statusErr != nil {
+		t.Fatalf("status error = %+v", statusErr)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("expired starting status took %s, want nonblocking stale transition", elapsed)
+	}
+	if len(status) != 1 || status[0].State != "stale" {
+		t.Fatalf("status records = %+v, want one stale session", status)
+	}
+	recordAfter, err := ReadSessionRecord(paths, record.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordAfter.State != "stale" {
+		t.Fatalf("stored session state = %q, want stale", recordAfter.State)
 	}
 }
 

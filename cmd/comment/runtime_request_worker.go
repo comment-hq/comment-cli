@@ -39,7 +39,7 @@ const (
 	runtimeRequestRequestTimeout = 30 * time.Second
 	// runtimeRequestLaunchTimeout bounds the detached `comment run` (skip-attach):
 	// a clean exit means started, a non-zero/timeout exit means failed.
-	runtimeRequestLaunchTimeout = 60 * time.Second
+	runtimeRequestLaunchTimeout    = managedSessionStartWait + 15*time.Second
 	runtimeRequestCapabilityHeader = "X-Comment-Daemon-Capabilities"
 	runtimeRequestCapability       = "agent_runtime_start:v1"
 )

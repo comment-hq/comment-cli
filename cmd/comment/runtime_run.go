@@ -106,7 +106,8 @@ const (
 	runtimeExitOutputMaxLines = 80
 	runtimeExitOutputMaxBytes = runtimeTailDefaultBytes
 	runtimeExitOutputWait     = 500 * time.Millisecond
-	managedSessionStartWait   = 30 * time.Second
+	managedSessionStartWait   = 2*time.Minute + 30*time.Second
+	managedSessionSendWait    = managedSessionStartWait + 30*time.Second
 )
 
 var errBotletsRunShortcutNotFound = errors.New("botlets run shortcut not found")

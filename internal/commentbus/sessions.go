@@ -43,6 +43,7 @@ type SessionRecord struct {
 	WorkingDir        string                     `json:"working_dir,omitempty"`
 	OutputLogPath     string                     `json:"output_log_path,omitempty"`
 	CreatedAt         string                     `json:"created_at"`
+	StartupStartedAt  string                     `json:"startup_started_at,omitempty"`
 	LastNudge         LastNudgeRecord            `json:"last_nudge"`
 	AutomaticNudges   map[string]LastNudgeRecord `json:"automatic_nudges,omitempty"`
 	DailyReset        *DailyResetRecord          `json:"daily_reset,omitempty"`

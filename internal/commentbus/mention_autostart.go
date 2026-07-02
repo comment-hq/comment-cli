@@ -51,7 +51,7 @@ const (
 	// thing that bounds it short of daemon shutdown. It is generous enough to cover a
 	// slow skip-attach start — the launch helper applies its own tighter exec timeout
 	// (runtimeRequestLaunchTimeout) — while still preventing an indefinite hang.
-	mentionAutoStartLaunchTimeout = 2 * time.Minute
+	mentionAutoStartLaunchTimeout = 3 * time.Minute
 )
 
 // mentionAutoStartRecord is the per-recipient backoff + in-flight state. Guarded

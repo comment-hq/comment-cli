@@ -189,8 +189,20 @@ func TestDocsCommandPrintsFullCLIReference(t *testing.T) {
 }
 
 func TestMessagesSendTimeoutAllowsManagedColdStart(t *testing.T) {
-	if messagesSendResponseTimeout() < managedSessionStartWait {
-		t.Fatalf("messages send timeout = %s, want at least managed session start wait %s", messagesSendResponseTimeout(), managedSessionStartWait)
+	if messagesSendResponseTimeout(0) < managedSessionStartWait+30*time.Second {
+		t.Fatalf("messages send timeout = %s, want at least 30s beyond managed session start wait %s", messagesSendResponseTimeout(0), managedSessionStartWait)
+	}
+	if got, want := messagesSendResponseTimeout(2), 2*managedSessionSendWait; got != want {
+		t.Fatalf("messages send timeout for 2 recipients = %s, want %s", got, want)
+	}
+}
+
+func TestManagedSessionStartWaitAllowsSlowBotletStartup(t *testing.T) {
+	if managedSessionStartWait < 2*time.Minute+30*time.Second {
+		t.Fatalf("managed session start wait = %s, want enough time for stale-start recovery plus replacement", managedSessionStartWait)
+	}
+	if runtimeRequestLaunchTimeout <= managedSessionStartWait {
+		t.Fatalf("runtime request launch timeout = %s, want longer than managed session start wait %s", runtimeRequestLaunchTimeout, managedSessionStartWait)
 	}
 }
 

@@ -22,28 +22,29 @@ import (
 )
 
 const (
-	maxSocketRequestBytes              = 1 << 20
-	socketReadTimeout                  = 5 * time.Second
-	socketWriteTimeout                 = 5 * time.Second
-	slowSocketRequestDuration          = time.Second
-	slowSocketLockWaitDuration         = 250 * time.Millisecond
-	slowCloudMutationDuration          = time.Second
-	startupProbeTimeout                = 250 * time.Millisecond
-	sessionRuntimeStartupTimeout       = 2 * time.Second
-	sessionRuntimeStartupPoll          = 50 * time.Millisecond
-	defaultTmuxSubmitDelay             = 750 * time.Millisecond
-	maxTmuxSubmitDelay                 = 5 * time.Second
-	claudeTrustPromptMaxWait           = 6 * time.Second
-	claudeTrustPromptPoll              = 150 * time.Millisecond
-	cloudNotificationTransportSlack    = 100 * time.Millisecond
-	cloudNotificationLeaseProbeTimeout = time.Second
-	cloudNotificationPollIdleDelay     = 250 * time.Millisecond
-	cloudNotificationPollErrorDelay    = 5 * time.Second
-	automaticNudgeInitialBackoff       = 30 * time.Second
-	automaticNudgeMaxBackoff           = 5 * time.Minute
-	automaticNudgeMaxAttempts          = 3
-	automaticNudgeStateLimit           = 256
-	dispatchReadySummaryLimit          = 50
+	maxSocketRequestBytes               = 1 << 20
+	socketReadTimeout                   = 5 * time.Second
+	socketWriteTimeout                  = 5 * time.Second
+	slowSocketRequestDuration           = time.Second
+	slowSocketLockWaitDuration          = 250 * time.Millisecond
+	slowCloudMutationDuration           = time.Second
+	startupProbeTimeout                 = 250 * time.Millisecond
+	sessionRuntimeStartupTimeout        = 2 * time.Second
+	managedSessionRuntimeStartupTimeout = time.Minute
+	sessionRuntimeStartupPoll           = 50 * time.Millisecond
+	defaultTmuxSubmitDelay              = 750 * time.Millisecond
+	maxTmuxSubmitDelay                  = 5 * time.Second
+	claudeTrustPromptMaxWait            = 6 * time.Second
+	claudeTrustPromptPoll               = 150 * time.Millisecond
+	cloudNotificationTransportSlack     = 100 * time.Millisecond
+	cloudNotificationLeaseProbeTimeout  = time.Second
+	cloudNotificationPollIdleDelay      = 250 * time.Millisecond
+	cloudNotificationPollErrorDelay     = 5 * time.Second
+	automaticNudgeInitialBackoff        = 30 * time.Second
+	automaticNudgeMaxBackoff            = 5 * time.Minute
+	automaticNudgeMaxAttempts           = 3
+	automaticNudgeStateLimit            = 256
+	dispatchReadySummaryLimit           = 50
 	// cloudNotificationAuthRevokedDelay is the back-off when the wake socket
 	// closes with WS_AGENT_AUTH_REVOKED_CLOSE_CODE (4431). Reconnecting with
 	// the same credentials will be rejected; the operator must re-issue agent
@@ -2641,7 +2642,7 @@ func (d *Daemon) createAndLaunchSessionLockedWithContext(ctx context.Context, pr
 		_ = controller.KillSession(context.Background(), record.SessionName)
 		return SessionRecord{}, socketError("UPSTREAM_ERROR", "could not record session pane target", true)
 	}
-	if runtimeErr := d.waitForSessionRuntimeLockedWithContext(ctx, record, sessionRuntimeStartupTimeout); runtimeErr != nil {
+	if runtimeErr := d.waitForSessionRuntimeLockedWithContext(ctx, record, managedSessionRuntimeStartupTimeout); runtimeErr != nil {
 		_ = controller.KillSession(context.Background(), record.SessionName)
 		record.State = "dead"
 		_ = d.writeSessionRecordLocked(record)
@@ -2669,6 +2670,7 @@ func (d *Daemon) createAndLaunchSessionLockedWithContext(ctx context.Context, pr
 		})
 	}
 	record.State = "alive"
+	record.StartupStartedAt = ""
 	if err := d.writeSessionRecordLocked(record); err != nil {
 		_ = controller.KillSession(context.Background(), record.SessionName)
 		return SessionRecord{}, socketError("UPSTREAM_ERROR", "could not activate session", true)
@@ -3189,6 +3191,7 @@ func (d *Daemon) relaunchManagedBmuxSessionLocked(ctx context.Context, record Se
 	record.BotletsHome = botletsHome
 	record.RuntimeCommand = managedSessionRuntimeCommandForLaunch(record.Runtime, record.BotName, record.RuntimeSessionRef, launchMode)
 	record.PaneTarget = ""
+	record.StartupStartedAt = busTime(d.currentTime())
 	record.State = "starting"
 	if err := d.writeSessionRecordLocked(record); err != nil {
 		return SessionRecord{}, false, socketError("UPSTREAM_ERROR", "could not prepare session restart", true)
@@ -3209,7 +3212,7 @@ func (d *Daemon) relaunchManagedBmuxSessionLocked(ctx context.Context, record Se
 		_ = controller.KillSession(context.Background(), record.SessionName)
 		return d.failManagedBmuxRelaunchLockedWithOptions(record, "pane_target_unavailable", socketError("UPSTREAM_ERROR", "could not record session pane target", true), options)
 	}
-	if runtimeErr := d.waitForSessionRuntimeLockedWithContext(ctx, record, sessionRuntimeStartupTimeout); runtimeErr != nil {
+	if runtimeErr := d.waitForSessionRuntimeLockedWithContext(ctx, record, managedSessionRuntimeStartupTimeout); runtimeErr != nil {
 		_ = controller.KillSession(context.Background(), record.SessionName)
 		return d.failManagedBmuxRelaunchLockedWithOptions(record, "runtime_start_failed", runtimeErr, options)
 	}
@@ -4133,7 +4136,7 @@ func (d *Daemon) sessionStatus(req SocketRequest) ([]SessionRecord, *SocketError
 		if err != nil {
 			return nil, socketError("FORBIDDEN", "invalid session capability", false)
 		}
-		record, syncErr := d.syncSessionLivenessLocked(record)
+		record, syncErr := d.syncSessionStatusLivenessLocked(record)
 		if syncErr != nil {
 			return nil, syncErr
 		}
@@ -4145,7 +4148,7 @@ func (d *Daemon) sessionStatus(req SocketRequest) ([]SessionRecord, *SocketError
 	}
 	filtered := filterSessions(records, req.Params)
 	for i := range filtered {
-		record, syncErr := d.syncSessionLivenessLocked(filtered[i])
+		record, syncErr := d.syncSessionStatusLivenessLocked(filtered[i])
 		if syncErr != nil {
 			return nil, syncErr
 		}
@@ -4155,28 +4158,73 @@ func (d *Daemon) sessionStatus(req SocketRequest) ([]SessionRecord, *SocketError
 }
 
 func (d *Daemon) syncSessionLivenessLocked(record SessionRecord) (SessionRecord, *SocketError) {
+	return d.syncSessionLivenessLockedWithOptions(record, true)
+}
+
+func (d *Daemon) syncSessionStatusLivenessLocked(record SessionRecord) (SessionRecord, *SocketError) {
+	return d.syncSessionLivenessLockedWithOptions(record, false)
+}
+
+func (d *Daemon) syncSessionLivenessLockedWithOptions(record SessionRecord, waitForStartingRuntime bool) (SessionRecord, *SocketError) {
 	if record.State != "alive" && record.State != "starting" {
 		return record, nil
 	}
-	record, live, err := d.recoverLiveTmuxSessionLocked(record)
+	var (
+		live bool
+		err  *SocketError
+	)
+	if waitForStartingRuntime {
+		record, live, err = d.recoverLiveTmuxSessionLocked(record)
+	} else {
+		record, live, err = d.inspectLiveTmuxSessionLocked(record, true)
+	}
 	if err != nil {
 		return SessionRecord{}, err
 	}
 	if live {
-		runtimeReason, runtimeErr := d.sessionRuntimeIssueLocked(record, record.State == "starting")
-		if runtimeErr != nil {
-			return SessionRecord{}, runtimeErr
-		}
-		if runtimeReason != "" {
-			_, staleErr := d.markSessionStaleLocked(record, runtimeReason)
-			if staleErr != nil {
-				return SessionRecord{}, staleErr
+		if record.State == "starting" && !waitForStartingRuntime {
+			running, runtimeReason, runtimeErr := d.sessionRuntimeStatusLocked(record)
+			if runtimeErr != nil {
+				return SessionRecord{}, runtimeErr
 			}
-			record.State = "stale"
-			if runtimeReason == "runtime_untrusted" {
-				return record, socketError("UPSTREAM_ERROR", "could not verify session runtime", true)
+			if runtimeReason != "" {
+				_, staleErr := d.markSessionStaleLocked(record, runtimeReason)
+				if staleErr != nil {
+					return SessionRecord{}, staleErr
+				}
+				record.State = "stale"
+				if runtimeReason == "runtime_untrusted" {
+					return record, socketError("UPSTREAM_ERROR", "could not verify session runtime", true)
+				}
+				return record, nil
 			}
-			return record, nil
+			if !running {
+				if managedSessionStartupRemaining(record, time.Now()) <= 0 {
+					_, staleErr := d.markSessionStaleLocked(record, "runtime_not_running")
+					if staleErr != nil {
+						return SessionRecord{}, staleErr
+					}
+					record.State = "stale"
+					return record, nil
+				}
+				return record, nil
+			}
+		} else {
+			runtimeReason, runtimeErr := d.sessionRuntimeIssueLocked(record, record.State == "starting")
+			if runtimeErr != nil {
+				return SessionRecord{}, runtimeErr
+			}
+			if runtimeReason != "" {
+				_, staleErr := d.markSessionStaleLocked(record, runtimeReason)
+				if staleErr != nil {
+					return SessionRecord{}, staleErr
+				}
+				record.State = "stale"
+				if runtimeReason == "runtime_untrusted" {
+					return record, socketError("UPSTREAM_ERROR", "could not verify session runtime", true)
+				}
+				return record, nil
+			}
 		}
 		if record.State == "starting" {
 			record.State = "alive"
@@ -5098,23 +5146,39 @@ func (d *Daemon) verifySessionRuntimeTrustLocked(record SessionRecord) *SocketEr
 	return nil
 }
 
-func (d *Daemon) sessionRuntimeIssueLocked(record SessionRecord, waitForRuntime bool) (string, *SocketError) {
+func (d *Daemon) sessionRuntimeStatusLocked(record SessionRecord) (bool, string, *SocketError) {
 	if record.PaneTarget == "" {
-		return "tmux_session_missing", nil
+		return false, "tmux_session_missing", nil
 	}
 	if err := sessionRuntimeResolvable(record); err != nil {
-		return "runtime_untrusted", nil
+		return false, "runtime_untrusted", nil
 	}
-	deadline := time.Now().Add(sessionRuntimeStartupTimeout)
-	for {
-		currentCommand, err := d.controllerForSession(record).PaneCurrentCommand(context.Background(), record.PaneTarget)
-		if err != nil {
-			if errors.Is(err, ErrTmuxSessionMissing) {
-				return "tmux_session_missing", nil
-			}
-			return "", socketError("UPSTREAM_ERROR", "could not inspect session foreground command", true)
+	currentCommand, err := d.controllerForSession(record).PaneCurrentCommand(context.Background(), record.PaneTarget)
+	if err != nil {
+		if errors.Is(err, ErrTmuxSessionMissing) {
+			return false, "tmux_session_missing", nil
 		}
-		if sessionPaneRunsExpectedRuntime(record, currentCommand) {
+		return false, "", socketError("UPSTREAM_ERROR", "could not inspect session foreground command", true)
+	}
+	return sessionPaneRunsExpectedRuntime(record, currentCommand), "", nil
+}
+
+func (d *Daemon) sessionRuntimeIssueLocked(record SessionRecord, waitForRuntime bool) (string, *SocketError) {
+	timeout := sessionRuntimeStartupTimeout
+	now := time.Now()
+	if waitForRuntime {
+		timeout = managedSessionStartupRemaining(record, now)
+	}
+	deadline := now.Add(timeout)
+	for {
+		running, runtimeReason, runtimeErr := d.sessionRuntimeStatusLocked(record)
+		if runtimeErr != nil {
+			return "", runtimeErr
+		}
+		if runtimeReason != "" {
+			return runtimeReason, nil
+		}
+		if running {
 			return "", nil
 		}
 		if !waitForRuntime {
@@ -5125,6 +5189,28 @@ func (d *Daemon) sessionRuntimeIssueLocked(record SessionRecord, waitForRuntime 
 		}
 		time.Sleep(sessionRuntimeStartupPoll)
 	}
+}
+
+func managedSessionStartupRemaining(record SessionRecord, now time.Time) time.Duration {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	startedAtText := record.StartupStartedAt
+	if startedAtText == "" {
+		startedAtText = record.CreatedAt
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, startedAtText)
+	if err != nil {
+		return managedSessionRuntimeStartupTimeout
+	}
+	elapsed := now.Sub(startedAt)
+	if elapsed <= 0 {
+		return managedSessionRuntimeStartupTimeout
+	}
+	if elapsed >= managedSessionRuntimeStartupTimeout {
+		return 0
+	}
+	return managedSessionRuntimeStartupTimeout - elapsed
 }
 
 func (d *Daemon) waitForSessionRuntimeLocked(record SessionRecord, timeout time.Duration) *SocketError {
@@ -5142,18 +5228,27 @@ func (d *Daemon) waitForSessionRuntimeLockedWithContext(ctx context.Context, rec
 		return socketError("UPSTREAM_ERROR", "could not verify session runtime", true)
 	}
 	deadline := time.Now().Add(timeout)
+	inspectFailed := false
 	for {
 		if ctx.Err() != nil {
 			return socketError("CONFLICT", "session startup canceled", false)
 		}
 		currentCommand, err := d.controllerForSession(record).PaneCurrentCommand(ctx, record.PaneTarget)
 		if err != nil {
-			return socketError("UPSTREAM_ERROR", "could not inspect session foreground command", true)
-		}
-		if sessionPaneRunsExpectedRuntime(record, currentCommand) {
-			return nil
+			if errors.Is(err, ErrTmuxSessionMissing) {
+				return socketError("CONFLICT", "session is not running", false)
+			}
+			inspectFailed = true
+		} else {
+			inspectFailed = false
+			if sessionPaneRunsExpectedRuntime(record, currentCommand) {
+				return nil
+			}
 		}
 		if !time.Now().Before(deadline) {
+			if inspectFailed {
+				return socketError("UPSTREAM_ERROR", "could not inspect session foreground command", true)
+			}
 			return socketError("UPSTREAM_ERROR", "session runtime did not start", true)
 		}
 		if !sleepWithContext(ctx, sessionRuntimeStartupPoll) {

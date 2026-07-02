@@ -291,11 +291,14 @@ func runMessagesSend(args []string) error {
 	if *idempotencyKey != "" {
 		params["idempotency_key"] = *idempotencyKey
 	}
-	return callSocketAndPrint(context.Background(), paths, "messages.send", auth, params, messagesSendResponseTimeout())
+	return callSocketAndPrint(context.Background(), paths, "messages.send", auth, params, messagesSendResponseTimeout(len(to)))
 }
 
-func messagesSendResponseTimeout() time.Duration {
-	return managedSessionStartWait
+func messagesSendResponseTimeout(recipientCount int) time.Duration {
+	if recipientCount < 1 {
+		recipientCount = 1
+	}
+	return managedSessionSendWait * time.Duration(recipientCount)
 }
 
 func runMessagesWait(args []string) error {
